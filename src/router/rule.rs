@@ -54,7 +54,7 @@ impl ShardingRule {
 }
 
 /// Router configuration holding all sharding rules
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RouterConfig {
     /// Sharding rules indexed by table pattern
     rules: HashMap<String, ShardingRule>,

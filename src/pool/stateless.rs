@@ -105,6 +105,7 @@ impl StatelessPool {
     /// Return a connection to the pool
     ///
     /// If the pool is full, the connection is dropped.
+    /// Connection is reset before returning to pool to prevent state leakage.
     pub async fn put(&self, mut conn: PooledConnection) {
         conn.release();
 
@@ -116,6 +117,13 @@ impl StatelessPool {
 
         if conn.is_expired(self.config.max_age) {
             debug!("Connection expired, discarding");
+            return;
+        }
+
+        // Reset connection state to prevent session state leakage
+        // COM_RESET_CONNECTION clears session variables, temp tables, prepared statements, etc.
+        if !conn.reset().await {
+            warn!("Failed to reset connection, discarding");
             return;
         }
 

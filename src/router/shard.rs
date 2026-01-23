@@ -24,7 +24,7 @@ impl ShardAlgorithm {
 }
 
 /// Shard calculator
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ShardCalculator {
     algorithm: ShardAlgorithm,
     shard_count: usize,

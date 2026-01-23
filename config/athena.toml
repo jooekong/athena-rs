@@ -21,3 +21,30 @@ max_concurrent_per_user_shard = 10
 queue_size = 100
 # Timeout in milliseconds for waiting in queue
 queue_timeout_ms = 5000
+
+# Sharding rules (optional)
+# Each [[sharding]] block defines a sharding rule for a table
+
+# Example: shard 'users' table by 'user_id' using mod algorithm
+# [[sharding]]
+# name = "user_shard"
+# table_pattern = "users"
+# shard_column = "user_id"
+# algorithm = "mod"      # mod, hash, or range
+# shard_count = 4
+
+# Example: shard 'orders' table by 'order_id' using hash algorithm
+# [[sharding]]
+# name = "order_shard"
+# table_pattern = "orders"
+# shard_column = "order_id"
+# algorithm = "hash"
+# shard_count = 8
+
+# Example: shard 'logs' table by 'timestamp' using range algorithm
+# [[sharding]]
+# name = "log_shard"
+# table_pattern = "logs"
+# shard_column = "log_date"
+# algorithm = "range"
+# range_boundaries = [20230101, 20230401, 20230701, 20231001]

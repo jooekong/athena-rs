@@ -1,11 +1,15 @@
 use serde::Deserialize;
 
+use crate::router::ShardingRule;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
     pub backend: BackendConfig,
     #[serde(default)]
     pub circuit: CircuitConfig,
+    #[serde(default)]
+    pub sharding: Vec<ShardingRule>,
 }
 
 /// Circuit breaker / rate limiting configuration
@@ -88,6 +92,7 @@ impl Default for Config {
                 database: None,
             },
             circuit: CircuitConfig::default(),
+            sharding: Vec::new(),
         }
     }
 }

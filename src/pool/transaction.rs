@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -13,25 +12,31 @@ use super::connection::{ConnectionError, PooledConnection};
 /// Each session that starts a transaction gets a dedicated connection
 /// that is held until the transaction completes.
 pub struct TransactionPool {
-    /// Backend configuration
-    backend_config: Arc<BackendConfig>,
     /// Connections bound to sessions (session_id -> connection)
     bound: Mutex<HashMap<u32, PooledConnection>>,
 }
 
+impl Default for TransactionPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransactionPool {
     /// Create a new transaction pool
-    pub fn new(backend_config: Arc<BackendConfig>) -> Self {
+    pub fn new() -> Self {
         Self {
-            backend_config,
             bound: Mutex::new(HashMap::new()),
         }
     }
 
     /// Get the bound connection for a session, or create a new one
+    ///
+    /// The backend_config determines which shard the transaction connects to.
     pub async fn get_or_create(
         &self,
         session_id: u32,
+        backend_config: &BackendConfig,
         database: Option<String>,
     ) -> Result<(), ConnectionError> {
         let mut bound = self.bound.lock().await;
@@ -41,9 +46,9 @@ impl TransactionPool {
             return Ok(());
         }
 
-        // Create a new connection for this session
-        debug!(session_id = session_id, "Creating bound connection for session");
-        let mut conn = PooledConnection::connect(&self.backend_config, database).await?;
+        // Create a new connection for this session using the specified backend
+        debug!(session_id = session_id, host = %backend_config.host, "Creating bound connection for session");
+        let mut conn = PooledConnection::connect(backend_config, database).await?;
         conn.acquire();
         bound.insert(session_id, conn);
         Ok(())

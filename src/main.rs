@@ -16,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 use circuit::{ConcurrencyController, LimitConfig};
 use config::Config;
 use pool::{PoolManager, StatelessPoolConfig};
+use router::RouterConfig;
 use session::Session;
 
 /// Global connection counter for generating unique session IDs
@@ -53,6 +54,21 @@ async fn main() -> anyhow::Result<()> {
         "Circuit breaker configured"
     );
 
+    // Build router config from sharding rules
+    let mut router_config = RouterConfig::new();
+    for rule in &config.sharding {
+        info!(
+            name = %rule.name,
+            table = %rule.table_pattern,
+            column = %rule.shard_column,
+            algorithm = %rule.algorithm,
+            shard_count = rule.shard_count,
+            "Loaded sharding rule"
+        );
+        router_config.add_rule(rule.clone());
+    }
+    let router_config = Arc::new(router_config);
+
     let addr = format!("{}:{}", config.server.listen_addr, config.server.listen_port);
     let listener = TcpListener::bind(&addr).await?;
 
@@ -70,11 +86,12 @@ async fn main() -> anyhow::Result<()> {
         let session_id = CONNECTION_COUNTER.fetch_add(1, Ordering::SeqCst);
         let pool_manager = pool_manager.clone();
         let concurrency_controller = concurrency_controller.clone();
+        let router_config = (*router_config).clone();
 
         info!(session_id = session_id, peer = %peer_addr, "New connection");
 
         tokio::spawn(async move {
-            let session = Session::new(session_id, pool_manager, concurrency_controller);
+            let session = Session::with_router(session_id, pool_manager, concurrency_controller, router_config);
             if let Err(e) = session.run(stream).await {
                 warn!(session_id = session_id, error = %e, "Session ended with error");
             } else {

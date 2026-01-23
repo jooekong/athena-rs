@@ -226,6 +226,32 @@ done
 
 ---
 
+### Bug Fixes ✅
+
+**修复的问题：**
+
+1. **[Critical] 连接池状态泄漏**
+   - 问题：`StatelessPool::put` 归还连接时未 reset，导致会话状态泄漏
+   - 修复：归还前调用 `COM_RESET_CONNECTION`
+
+2. **[Critical] 事务路由忽略分片**
+   - 问题：`begin_transaction` 总是使用默认后端，忽略 `shard_id` 参数
+   - 修复：`TransactionPool` 支持动态 backend 配置，从 backends 获取正确分片
+
+3. **[High] 分片配置未接入**
+   - 问题：Session 使用 `Router::default()`，配置中的分片规则未加载
+   - 修复：在 `Config` 中添加 `sharding` 字段，main.rs 构建 `RouterConfig` 并传入 Session
+
+4. **[High] 空分片列表 panic**
+   - 问题：Router 交集逻辑可能返回空 shards，导致 `shards[0]` panic
+   - 修复：Router 在空交集时回退到默认分片
+
+5. **[High] Scatter 查询协议问题**
+   - 问题：多分片查询每个分片都发送 EOF，违反 MySQL 协议
+   - 修复：只有最后一个分片发送 EOF
+
+---
+
 ### Phase 6: 完善与优化 ⏳ 待开始
 
 **待完成：**

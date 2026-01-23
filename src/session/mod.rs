@@ -407,8 +407,10 @@ impl Session {
 
         let mut first_shard = true;
         let mut column_count = 0u64;
+        let total_shards = route_result.shards.len();
 
-        for shard_id in &route_result.shards {
+        for (shard_idx, shard_id) in route_result.shards.iter().enumerate() {
+            let is_last_shard = shard_idx == total_shards - 1;
             // Acquire rate limit permit for this shard
             let _permit = match self.acquire_permit(&shard_id.0, client).await? {
                 AcquireResult::Acquired(permit) => Some(permit),
@@ -455,7 +457,7 @@ impl Session {
 
             // Read response
             let result = self
-                .forward_scatter_response(client, &mut conn, first_shard, &mut column_count)
+                .forward_scatter_response(client, &mut conn, first_shard, is_last_shard, &mut column_count)
                 .await;
 
             // Return connection to pool
@@ -476,11 +478,16 @@ impl Session {
     }
 
     /// Forward scatter response, handling column definitions and rows
+    ///
+    /// # Arguments
+    /// * `send_columns` - Whether to send column definitions (true for first shard only)
+    /// * `is_last_shard` - Whether this is the last shard (determines if EOF is sent)
     async fn forward_scatter_response<C>(
         &self,
         client: &mut Framed<C, PacketCodec>,
         conn: &mut PooledConnection,
         send_columns: bool,
+        is_last_shard: bool,
         column_count: &mut u64,
     ) -> Result<(), SessionError>
     where
@@ -493,7 +500,8 @@ impl Session {
             .map_err(|_| SessionError::BackendDisconnected)?;
 
         if is_ok_packet(&first.payload) || is_err_packet(&first.payload) {
-            if send_columns {
+            // For OK/ERR packets, only forward on last shard to avoid confusing client
+            if is_last_shard {
                 client.send(first).await?;
             }
             return Ok(());
@@ -544,8 +552,9 @@ impl Session {
                 client.send(packet).await?;
             } else {
                 // Only forward final EOF from last shard
-                // For simplicity, always forward for now
-                client.send(packet).await?;
+                if is_last_shard {
+                    client.send(packet).await?;
+                }
                 break;
             }
         }

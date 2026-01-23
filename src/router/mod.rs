@@ -87,8 +87,11 @@ impl Router {
             }
         }
 
-        // If no sharded tables, use default shard
-        let shards = target_shards.unwrap_or_else(|| vec![0]);
+        // If no sharded tables or empty intersection, use default shard
+        let shards = match target_shards {
+            Some(s) if !s.is_empty() => s,
+            _ => vec![0], // Default shard for non-sharded tables or empty intersection
+        };
         let is_scatter = shards.len() > 1;
 
         // Generate rewritten SQL for each shard

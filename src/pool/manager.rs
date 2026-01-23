@@ -51,7 +51,7 @@ impl PoolManager {
     /// Create a new pool manager with a single default backend
     pub fn new(backend_config: BackendConfig, pool_config: StatelessPoolConfig) -> Self {
         let backend_config = Arc::new(backend_config);
-        let transaction_pool = Arc::new(TransactionPool::new(backend_config.clone()));
+        let transaction_pool = Arc::new(TransactionPool::new());
 
         let mut stateless_pools = HashMap::new();
         let default_pool = Arc::new(StatelessPool::new(
@@ -216,16 +216,23 @@ impl PoolManager {
     }
 
     /// Get or create a transaction connection for a session
+    ///
+    /// Routes to the correct shard's master backend.
     pub async fn begin_transaction(
         &self,
         session_id: u32,
         shard_id: &ShardId,
         database: Option<String>,
     ) -> Result<(), ConnectionError> {
-        // For now, transaction pool uses default backend
-        // In Phase 3, we'll route to the correct shard
+        // Get backend config for the specified shard
+        let backends = self.backends.read().await;
+        let backend = backends
+            .get(shard_id)
+            .or_else(|| backends.get(&ShardId::default_shard()))
+            .ok_or(ConnectionError::Disconnected)?;
+
         self.transaction_pool
-            .get_or_create(session_id, database)
+            .get_or_create(session_id, &backend.master, database)
             .await
     }
 
