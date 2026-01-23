@@ -1,0 +1,23 @@
+# Athena MySQL Proxy Configuration
+
+[server]
+listen_addr = "127.0.0.1"
+listen_port = 3307
+
+[backend]
+host = "127.0.0.1"
+port = 3306
+user = "root"
+password = ""
+# database = "test"
+
+# Circuit breaker / rate limiting configuration
+[circuit]
+# Enable/disable rate limiting
+enabled = true
+# Maximum concurrent requests per (user, shard) pair
+max_concurrent_per_user_shard = 10
+# Maximum queue size for waiting requests
+queue_size = 100
+# Timeout in milliseconds for waiting in queue
+queue_timeout_ms = 5000
