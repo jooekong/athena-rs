@@ -142,15 +142,40 @@ impl SqlAnalyzer {
                         let cols: Vec<String> =
                             columns.iter().map(|c| c.value.clone()).collect();
 
-                        // Extract values from first row
-                        if let Some(first_row) = values.rows.first() {
-                            for (idx, expr) in first_row.iter().enumerate() {
+                        // Collect values from ALL rows, not just first row
+                        // This handles multi-row INSERT correctly
+                        let mut col_values: std::collections::HashMap<String, Vec<i64>> =
+                            std::collections::HashMap::new();
+
+                        for row in &values.rows {
+                            for (idx, expr) in row.iter().enumerate() {
                                 if idx < cols.len() {
                                     if let Some(val) = self.extract_literal_value(expr) {
-                                        shard_keys.push((cols[idx].clone(), ShardKeyValue::Single(val)));
+                                        col_values
+                                            .entry(cols[idx].clone())
+                                            .or_default()
+                                            .push(val);
                                     }
                                 }
                             }
+                        }
+
+                        // Convert collected values to ShardKeyValue
+                        for (col, vals) in col_values {
+                            let shard_value = if vals.len() == 1 {
+                                ShardKeyValue::Single(vals[0])
+                            } else {
+                                // Multiple rows with potentially different values
+                                let mut unique_vals = vals.clone();
+                                unique_vals.sort();
+                                unique_vals.dedup();
+                                if unique_vals.len() == 1 {
+                                    ShardKeyValue::Single(unique_vals[0])
+                                } else {
+                                    ShardKeyValue::Multiple(unique_vals)
+                                }
+                            };
+                            shard_keys.push((col, shard_value));
                         }
                     }
                 }

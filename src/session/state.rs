@@ -7,6 +7,8 @@ pub struct SessionState {
     pub database: Option<String>,
     /// Whether client is in a transaction
     pub in_transaction: bool,
+    /// Shard bound to current transaction (if any)
+    pub transaction_shard: Option<String>,
     /// Client capability flags
     pub capability_flags: u32,
     /// Character set
@@ -29,11 +31,18 @@ impl SessionState {
     /// Start a transaction
     pub fn begin_transaction(&mut self) {
         self.in_transaction = true;
+        self.transaction_shard = None; // Will be bound on first query
+    }
+
+    /// Bind transaction to a specific shard
+    pub fn bind_transaction_shard(&mut self, shard: String) {
+        self.transaction_shard = Some(shard);
     }
 
     /// End a transaction
     pub fn end_transaction(&mut self) {
         self.in_transaction = false;
+        self.transaction_shard = None;
     }
 
     /// Change current database

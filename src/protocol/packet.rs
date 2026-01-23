@@ -91,6 +91,10 @@ pub mod capabilities {
     pub const CLIENT_DEPRECATE_EOF: u32 = 1 << 24;
 
     /// Default capabilities for proxy
+    ///
+    /// Note: CLIENT_MULTI_STATEMENTS is intentionally NOT included because
+    /// our SQL analyzer only processes the first statement. This prevents
+    /// clients from sending multi-statement queries.
     pub const DEFAULT_CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
         | CLIENT_FOUND_ROWS
         | CLIENT_LONG_FLAG
@@ -98,7 +102,6 @@ pub mod capabilities {
         | CLIENT_PROTOCOL_41
         | CLIENT_TRANSACTIONS
         | CLIENT_SECURE_CONNECTION
-        | CLIENT_MULTI_STATEMENTS
         | CLIENT_MULTI_RESULTS
         | CLIENT_PLUGIN_AUTH
         | CLIENT_DEPRECATE_EOF;

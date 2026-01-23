@@ -243,19 +243,38 @@ impl PooledConnection {
         self.state != ConnectionState::Closed
     }
 
+    /// Get backend capability flags
+    pub fn capabilities(&self) -> u32 {
+        self.capabilities
+    }
+
     /// Send a packet to the backend
     pub async fn send(&mut self, packet: Packet) -> Result<(), ConnectionError> {
-        self.framed.send(packet).await
-            .map_err(|e| ConnectionError::Io(e.to_string()))
+        match self.framed.send(packet).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Mark connection as closed on send error
+                self.state = ConnectionState::Closed;
+                Err(ConnectionError::Io(e.to_string()))
+            }
+        }
     }
 
     /// Receive a packet from the backend
     pub async fn recv(&mut self) -> Result<Packet, ConnectionError> {
-        self.framed
-            .next()
-            .await
-            .ok_or(ConnectionError::Disconnected)?
-            .map_err(|e| ConnectionError::Io(e.to_string()))
+        match self.framed.next().await {
+            Some(Ok(packet)) => Ok(packet),
+            Some(Err(e)) => {
+                // Mark connection as closed on receive error
+                self.state = ConnectionState::Closed;
+                Err(ConnectionError::Io(e.to_string()))
+            }
+            None => {
+                // Mark connection as closed on EOF
+                self.state = ConnectionState::Closed;
+                Err(ConnectionError::Disconnected)
+            }
+        }
     }
 
     /// Get inner framed connection for direct access

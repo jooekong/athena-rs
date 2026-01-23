@@ -42,6 +42,9 @@ impl SqlRewriter {
         // - UPDATE table_name
         // - table_name.column
         // - `table_name`
+        // And skip:
+        // - String literals ('...' and "...")
+        // - Comments (-- and /* */)
 
         let mut result = String::with_capacity(sql.len() + 32);
         let sql_bytes = sql.as_bytes();
@@ -50,6 +53,82 @@ impl SqlRewriter {
         let mut i = 0;
 
         while i < sql_bytes.len() {
+            // Skip single-quoted string literals
+            if sql_bytes[i] == b'\'' {
+                let start = i;
+                i += 1;
+                while i < sql_bytes.len() {
+                    if sql_bytes[i] == b'\'' {
+                        i += 1;
+                        // Handle escaped quotes ('')
+                        if i < sql_bytes.len() && sql_bytes[i] == b'\'' {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    // Handle backslash escape
+                    if sql_bytes[i] == b'\\' && i + 1 < sql_bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                }
+                result.push_str(&sql[start..i]);
+                continue;
+            }
+
+            // Skip double-quoted string literals
+            if sql_bytes[i] == b'"' {
+                let start = i;
+                i += 1;
+                while i < sql_bytes.len() {
+                    if sql_bytes[i] == b'"' {
+                        i += 1;
+                        // Handle escaped quotes ("")
+                        if i < sql_bytes.len() && sql_bytes[i] == b'"' {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    // Handle backslash escape
+                    if sql_bytes[i] == b'\\' && i + 1 < sql_bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                }
+                result.push_str(&sql[start..i]);
+                continue;
+            }
+
+            // Skip -- line comments
+            if i + 1 < sql_bytes.len() && sql_bytes[i] == b'-' && sql_bytes[i + 1] == b'-' {
+                let start = i;
+                i += 2;
+                while i < sql_bytes.len() && sql_bytes[i] != b'\n' {
+                    i += 1;
+                }
+                result.push_str(&sql[start..i]);
+                continue;
+            }
+
+            // Skip /* */ block comments
+            if i + 1 < sql_bytes.len() && sql_bytes[i] == b'/' && sql_bytes[i + 1] == b'*' {
+                let start = i;
+                i += 2;
+                while i + 1 < sql_bytes.len() {
+                    if sql_bytes[i] == b'*' && sql_bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                result.push_str(&sql[start..i]);
+                continue;
+            }
+
             // Check for backtick-quoted identifier
             if sql_bytes[i] == b'`' {
                 let start = i;
@@ -61,11 +140,15 @@ impl SqlRewriter {
                     i += 1; // include closing backtick
                 }
                 let quoted = &sql[start..i];
-                let inner = &quoted[1..quoted.len() - 1];
-                if inner.eq_ignore_ascii_case(old_name) {
-                    result.push('`');
-                    result.push_str(new_name);
-                    result.push('`');
+                if quoted.len() > 2 {
+                    let inner = &quoted[1..quoted.len() - 1];
+                    if inner.eq_ignore_ascii_case(old_name) {
+                        result.push('`');
+                        result.push_str(new_name);
+                        result.push('`');
+                    } else {
+                        result.push_str(quoted);
+                    }
                 } else {
                     result.push_str(quoted);
                 }
@@ -198,5 +281,48 @@ mod tests {
             SqlRewriter::generate_physical_table_name_padded("users", 123, 4),
             "users_0123"
         );
+    }
+
+    #[test]
+    fn test_skip_string_literals() {
+        let mut mappings = HashMap::new();
+        mappings.insert("users".to_string(), "users_3".to_string());
+
+        // Table name in string literal should NOT be replaced
+        let sql = "SELECT * FROM users WHERE name = 'users'";
+        let result = SqlRewriter::rewrite(sql, &mappings);
+        assert_eq!(result, "SELECT * FROM users_3 WHERE name = 'users'");
+
+        // Double quoted string
+        let sql2 = r#"SELECT * FROM users WHERE name = "users""#;
+        let result2 = SqlRewriter::rewrite(sql2, &mappings);
+        assert_eq!(result2, r#"SELECT * FROM users_3 WHERE name = "users""#);
+    }
+
+    #[test]
+    fn test_skip_comments() {
+        let mut mappings = HashMap::new();
+        mappings.insert("users".to_string(), "users_3".to_string());
+
+        // Table name in line comment should NOT be replaced
+        let sql = "SELECT * FROM users -- query users table";
+        let result = SqlRewriter::rewrite(sql, &mappings);
+        assert_eq!(result, "SELECT * FROM users_3 -- query users table");
+
+        // Table name in block comment should NOT be replaced
+        let sql2 = "SELECT * FROM users /* users table */";
+        let result2 = SqlRewriter::rewrite(sql2, &mappings);
+        assert_eq!(result2, "SELECT * FROM users_3 /* users table */");
+    }
+
+    #[test]
+    fn test_escaped_quotes_in_string() {
+        let mut mappings = HashMap::new();
+        mappings.insert("users".to_string(), "users_3".to_string());
+
+        // Escaped single quote
+        let sql = "SELECT * FROM users WHERE name = 'it''s users'";
+        let result = SqlRewriter::rewrite(sql, &mappings);
+        assert_eq!(result, "SELECT * FROM users_3 WHERE name = 'it''s users'");
     }
 }

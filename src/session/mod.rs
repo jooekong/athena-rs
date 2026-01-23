@@ -174,11 +174,6 @@ impl Session {
                 return Ok(());
             }
 
-            // Handle InitDb
-            if let ClientCommand::InitDb(ref db) = cmd {
-                self.state.change_database(db.clone());
-            }
-
             // Handle SQL queries with routing
             if let ClientCommand::Query(ref sql) = cmd {
                 self.handle_query(client, sql, &packet).await?;
@@ -209,6 +204,12 @@ impl Session {
                 // Use stateless connection from pool
                 self.execute_with_pooled(client, packet, &shard_id, RouteTarget::Master)
                     .await?;
+            }
+
+            // Update state AFTER successful backend execution
+            // This ensures state consistency on backend failure
+            if let ClientCommand::InitDb(ref db) = cmd {
+                self.state.change_database(db.clone());
             }
 
             // Handle transaction end
@@ -254,13 +255,13 @@ impl Session {
 
         // Handle transaction control statements
         if analysis.stmt_type == StatementType::Begin {
+            // Just mark state as in_transaction, actual connection binding is deferred
+            // until the first query determines the target shard
             self.state.begin_transaction();
-            let shard_id = ShardId::default_shard();
-            self.pool_manager
-                .begin_transaction(self.id, &shard_id, self.state.database.clone())
-                .await
-                .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
-            self.execute_with_transaction(client, original_packet.clone())
+            // Send OK to client immediately (BEGIN doesn't need backend execution)
+            let ok = OkPacket::new();
+            client
+                .send(ok.encode(1, self.state.capability_flags))
                 .await?;
             return Ok(());
         }
@@ -268,8 +269,17 @@ impl Session {
         if analysis.stmt_type == StatementType::Commit
             || analysis.stmt_type == StatementType::Rollback
         {
-            self.execute_with_transaction(client, original_packet.clone())
-                .await?;
+            if self.state.transaction_shard.is_some() {
+                // Transaction was bound to a shard, execute on backend
+                self.execute_with_transaction(client, original_packet.clone())
+                    .await?;
+            } else {
+                // Transaction was never bound (no queries executed), just send OK
+                let ok = OkPacket::new();
+                client
+                    .send(ok.encode(1, self.state.capability_flags))
+                    .await?;
+            }
             self.state.end_transaction();
             self.pool_manager.end_transaction(self.id).await;
             return Ok(());
@@ -286,8 +296,49 @@ impl Session {
             "Query routed"
         );
 
-        // If in transaction, use transaction-bound connection
+        // If in transaction, handle deferred binding and shard consistency
         if self.state.in_transaction {
+            // Scatter queries not allowed in transaction
+            if route_result.is_scatter {
+                let err = ErrPacket::new(
+                    1105, // ER_UNKNOWN_ERROR
+                    "HY000",
+                    "Scatter queries not allowed in transaction",
+                );
+                client
+                    .send(err.encode(1, self.state.capability_flags))
+                    .await?;
+                return Ok(());
+            }
+
+            let target_shard = &route_result.shards[0];
+
+            // First query in transaction - bind to shard
+            if self.state.transaction_shard.is_none() {
+                self.state.bind_transaction_shard(target_shard.0.clone());
+                self.pool_manager
+                    .begin_transaction(self.id, target_shard, self.state.database.clone())
+                    .await
+                    .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
+            } else {
+                // Check shard consistency
+                let bound_shard = self.state.transaction_shard.as_ref().unwrap();
+                if bound_shard != &target_shard.0 {
+                    let err = ErrPacket::new(
+                        1105,
+                        "HY000",
+                        &format!(
+                            "Cross-shard query in transaction not allowed (bound to {}, query targets {})",
+                            bound_shard, target_shard.0
+                        ),
+                    );
+                    client
+                        .send(err.encode(1, self.state.capability_flags))
+                        .await?;
+                    return Ok(());
+                }
+            }
+
             self.execute_with_transaction(client, original_packet.clone())
                 .await?;
             return Ok(());
@@ -467,7 +518,17 @@ impl Session {
                     .await;
             }
 
-            result?;
+            // If error occurred (already sent to client), abort remaining shards
+            if let Err(e) = result {
+                warn!(
+                    session_id = self.id,
+                    shard = %shard_id.0,
+                    error = %e,
+                    "Scatter query aborted due to shard error"
+                );
+                return Ok(()); // Error already sent to client, don't disconnect session
+            }
+
             // permit is automatically released when it goes out of scope
             first_shard = false;
         }
@@ -499,8 +560,16 @@ impl Session {
             .await
             .map_err(|_| SessionError::BackendDisconnected)?;
 
-        if is_ok_packet(&first.payload) || is_err_packet(&first.payload) {
-            // For OK/ERR packets, only forward on last shard to avoid confusing client
+        if is_err_packet(&first.payload) {
+            // Error from backend - forward immediately and signal caller to abort
+            client.send(first).await?;
+            return Err(SessionError::Protocol("Scatter query failed on shard".into()));
+        }
+
+        if is_ok_packet(&first.payload) {
+            // OK packet (for non-SELECT queries like UPDATE/DELETE)
+            // Only forward on last shard to avoid confusing client
+            // TODO: accumulate affected_rows across shards
             if is_last_shard {
                 client.send(first).await?;
             }
@@ -526,7 +595,9 @@ impl Session {
         }
 
         // Read EOF after columns (if not using deprecate EOF)
-        if !(self.state.capability_flags & capabilities::CLIENT_DEPRECATE_EOF != 0) {
+        // Use backend capabilities to determine EOF handling
+        let backend_caps = conn.capabilities();
+        if !(backend_caps & capabilities::CLIENT_DEPRECATE_EOF != 0) {
             let eof = conn
                 .recv()
                 .await
@@ -545,7 +616,7 @@ impl Session {
 
             let is_end = is_ok_packet(&packet.payload)
                 || is_err_packet(&packet.payload)
-                || is_eof_packet(&packet.payload, self.state.capability_flags);
+                || is_eof_packet(&packet.payload, backend_caps);
 
             // Always forward rows
             if !is_end {
@@ -593,11 +664,17 @@ impl Session {
     {
         let tx_pool = self.pool_manager.transaction_pool();
 
+        // Get backend capabilities for EOF detection
+        let backend_caps = tx_pool
+            .capabilities(self.id)
+            .await
+            .unwrap_or(self.state.capability_flags); // fallback to client caps if not found
+
         // Read first packet
         let first = tx_pool
             .recv(self.id)
             .await
-            .map_err(|e| SessionError::BackendDisconnected)?;
+            .map_err(|_e| SessionError::BackendDisconnected)?;
 
         if is_ok_packet(&first.payload) || is_err_packet(&first.payload) {
             client.send(first).await?;
@@ -611,11 +688,11 @@ impl Session {
             let packet = tx_pool
                 .recv(self.id)
                 .await
-                .map_err(|e| SessionError::BackendDisconnected)?;
+                .map_err(|_e| SessionError::BackendDisconnected)?;
 
             let is_end = is_ok_packet(&packet.payload)
                 || is_err_packet(&packet.payload)
-                || is_eof_packet(&packet.payload, self.state.capability_flags);
+                || is_eof_packet(&packet.payload, backend_caps);
 
             client.send(packet).await?;
 
@@ -624,17 +701,17 @@ impl Session {
             }
         }
 
-        // Handle deprecated EOF mode
-        if !(self.state.capability_flags & capabilities::CLIENT_DEPRECATE_EOF != 0) {
+        // Handle deprecated EOF mode (based on backend capabilities)
+        if !(backend_caps & capabilities::CLIENT_DEPRECATE_EOF != 0) {
             loop {
                 let packet = tx_pool
                     .recv(self.id)
                     .await
-                    .map_err(|e| SessionError::BackendDisconnected)?;
+                    .map_err(|_e| SessionError::BackendDisconnected)?;
 
                 let is_end = is_ok_packet(&packet.payload)
                     || is_err_packet(&packet.payload)
-                    || is_eof_packet(&packet.payload, self.state.capability_flags);
+                    || is_eof_packet(&packet.payload, backend_caps);
 
                 client.send(packet).await?;
 
@@ -693,6 +770,9 @@ impl Session {
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
+        // Use backend capabilities for EOF detection
+        let backend_caps = conn.capabilities();
+
         // Read first packet
         let first = conn
             .recv()
@@ -715,7 +795,7 @@ impl Session {
 
             let is_end = is_ok_packet(&packet.payload)
                 || is_err_packet(&packet.payload)
-                || is_eof_packet(&packet.payload, self.state.capability_flags);
+                || is_eof_packet(&packet.payload, backend_caps);
 
             client.send(packet).await?;
 
@@ -724,8 +804,8 @@ impl Session {
             }
         }
 
-        // Handle deprecated EOF mode
-        if !(self.state.capability_flags & capabilities::CLIENT_DEPRECATE_EOF != 0) {
+        // Handle deprecated EOF mode (based on backend capabilities)
+        if !(backend_caps & capabilities::CLIENT_DEPRECATE_EOF != 0) {
             loop {
                 let packet = conn
                     .recv()
@@ -734,7 +814,7 @@ impl Session {
 
                 let is_end = is_ok_packet(&packet.payload)
                     || is_err_packet(&packet.payload)
-                    || is_eof_packet(&packet.payload, self.state.capability_flags);
+                    || is_eof_packet(&packet.payload, backend_caps);
 
                 client.send(packet).await?;
 

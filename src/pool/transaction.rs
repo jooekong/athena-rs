@@ -130,4 +130,10 @@ impl TransactionPool {
             Err(ConnectionError::Disconnected)
         }
     }
+
+    /// Get capabilities of the bound connection
+    pub async fn capabilities(&self, session_id: u32) -> Option<u32> {
+        let bound = self.bound.lock().await;
+        bound.get(&session_id).map(|conn| conn.capabilities())
+    }
 }
