@@ -224,4 +224,65 @@ mod tests {
         assert_eq!(result.shards.len(), 1);
         assert!(!result.is_scatter);
     }
+
+    #[test]
+    fn test_route_empty_intersection_fallback() {
+        // Setup router with two tables that have different sharding
+        let mut config = RouterConfig::new();
+        config.add_rule(ShardingRule {
+            name: "users_shard".to_string(),
+            table_pattern: "users".to_string(),
+            shard_column: "user_id".to_string(),
+            algorithm: "mod".to_string(),
+            shard_count: 4,
+            range_boundaries: vec![],
+        });
+        config.add_rule(ShardingRule {
+            name: "orders_shard".to_string(),
+            table_pattern: "orders".to_string(),
+            shard_column: "order_id".to_string(),
+            algorithm: "mod".to_string(),
+            shard_count: 4,
+            range_boundaries: vec![],
+        });
+        let router = Router::new(config);
+        let analyzer = SqlAnalyzer::new();
+
+        // Query joining two tables with incompatible shard keys
+        // user_id=1 -> shard 1, order_id=2 -> shard 2
+        // Intersection is empty, should fallback to default
+        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.user_id = 1 AND o.order_id = 2";
+        let analysis = analyzer.analyze(sql).unwrap();
+        let result = router.route(sql, &analysis, false);
+
+        // Should not panic, should have at least one shard
+        assert!(!result.shards.is_empty());
+    }
+
+    #[test]
+    fn test_route_in_values() {
+        let router = setup_router();
+        let analyzer = SqlAnalyzer::new();
+
+        // user_id IN (4, 5, 8) -> shards 0, 1, 0 -> unique: 0, 1
+        let sql = "SELECT * FROM users WHERE user_id IN (4, 5, 8)";
+        let analysis = analyzer.analyze(sql).unwrap();
+        let result = router.route(sql, &analysis, false);
+
+        assert_eq!(result.shards.len(), 2);
+        assert!(result.is_scatter);
+    }
+
+    #[test]
+    fn test_route_write_to_master() {
+        let router = setup_router();
+        let analyzer = SqlAnalyzer::new();
+
+        let sql = "INSERT INTO users (user_id, name) VALUES (5, 'test')";
+        let analysis = analyzer.analyze(sql).unwrap();
+        let result = router.route(sql, &analysis, false);
+
+        assert_eq!(result.target, RouteTarget::Master);
+        assert_eq!(result.shards.len(), 1);
+    }
 }
