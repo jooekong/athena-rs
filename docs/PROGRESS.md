@@ -310,6 +310,76 @@ done
 
 ---
 
+### Phase 8: 多租户架构重构 ✅ 完成
+
+**目标：** 引入 Group/DBGroup/DBInstance 概念，简化限流实现
+
+**完成内容：**
+
+#### 8.1 配置结构重构
+- [x] `GroupConfig` - 客户端视角的逻辑 DB（1:1 对应租户）
+- [x] `DBGroupConfig` - 后端集群（对应一个 shard）
+- [x] `DBInstanceConfig` - 单个 MySQL 实例
+- [x] `LimiterConfig` - 每个 DBInstance 的限流配置
+
+#### 8.2 限流简化
+- [x] 新 `Limiter` 结构：可内嵌到 DBInstance，无需 DashMap
+- [x] 移除 `LimitKey = (user, shard)` 复杂 key 管理
+- [x] 保留旧 API（`ConcurrencyController`）用于向后兼容
+
+**配置示例：**
+```toml
+[[groups]]
+name = "tenant_a"
+
+[[groups.db_groups]]
+shard_id = "shard_0"
+
+[[groups.db_groups.instances]]
+host = "mysql-1"
+port = 3306
+role = "master"
+
+[groups.db_groups.instances.limiter]
+max_concurrent = 100
+max_queue_size = 50
+```
+
+**文件变更：**
+- `src/config/schema.rs` - 新增 Group/DBGroup/DBInstance/LimiterConfig
+- `src/circuit/limiter.rs` - 简化 Limiter 实现
+
+---
+
+### Phase 9: 读写分离增强 ✅ 完成
+
+**目标：** 完善读写分离机制，支持多主多从，防止连接污染
+
+**完成内容：**
+
+#### 9.1 配置结构增强
+- [x] `DBGroupConfig` 添加 `masters()`、`slaves()`、`primary_master()` 方法
+- [x] `has_slaves()` 方法用于检查是否有从库
+
+#### 9.2 实例选择策略
+- [x] `InstanceSelector` trait：可扩展的选择策略接口
+- [x] `FirstSelector`：选择第一个实例（默认主库策略）
+- [x] `RoundRobinSelector`：轮询选择（默认从库策略）
+- [x] `ReadWriteRouter`：读写路由器，支持 fallback
+
+#### 9.3 连接污染防护
+- [x] `SessionState.session_vars`：存储拦截的 SET 变量
+- [x] SET 命令解析：支持多种格式（`SET var=val`、`SET NAMES`、`SET @@session.var`）
+- [x] 事务关键命令例外：`SET autocommit`、`SET TRANSACTION` 在事务中转发
+
+**文件变更：**
+- `src/config/schema.rs` - DBGroupConfig helper 方法
+- `src/router/selector.rs` - 新增：实例选择策略
+- `src/session/state.rs` - session_vars 字段
+- `src/session/mod.rs` - SET 命令拦截逻辑
+
+---
+
 ## 目录结构
 
 ```
@@ -319,7 +389,7 @@ athena-rs/
 │   ├── main.rs                  # 入口，优雅关闭支持
 │   ├── config/
 │   │   ├── mod.rs
-│   │   └── schema.rs           # 包含 CircuitConfig
+│   │   └── schema.rs           # Group/DBGroup/DBInstance/LimiterConfig
 │   ├── protocol/
 │   │   ├── mod.rs
 │   │   ├── packet.rs
@@ -334,7 +404,8 @@ athena-rs/
 │   │   ├── mod.rs
 │   │   ├── shard.rs
 │   │   ├── rule.rs
-│   │   └── rw_split.rs
+│   │   ├── rw_split.rs
+│   │   └── selector.rs          # 实例选择策略（读写分离）
 │   ├── pool/
 │   │   ├── mod.rs
 │   │   ├── connection.rs       # 包含 backend_addr 追踪
@@ -343,12 +414,12 @@ athena-rs/
 │   │   └── manager.rs
 │   ├── circuit/
 │   │   ├── mod.rs
-│   │   └── limiter.rs          # ConcurrencyController（含快速路径）
+│   │   └── limiter.rs          # 简化的 Limiter（可内嵌）
 │   ├── metrics/
 │   │   └── mod.rs              # Prometheus 指标 + HTTP 端点
 │   └── session/
-│       ├── mod.rs              # 带 tracing spans + 事务 BEGIN 修复
-│       └── state.rs            # 包含 transaction_started 标志
+│       ├── mod.rs              # 带 tracing spans + SET 拦截
+│       └── state.rs            # 含 session_vars 存储
 ├── tests/
 │   └── integration/             # 集成测试
 │       ├── main.rs

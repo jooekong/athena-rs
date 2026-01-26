@@ -1,4 +1,8 @@
-use dashmap::DashMap;
+//! Simplified rate limiter for DBInstance
+//!
+//! Each DBInstance has its own embedded Limiter, eliminating the need for
+//! dynamic key management (DashMap) and complex LimitKey structures.
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,116 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::config::CircuitConfig;
-
-/// Key for identifying rate limit scope
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LimitKey {
-    /// Username
-    pub user: String,
-    /// Shard identifier
-    pub shard: String,
-}
-
-impl LimitKey {
-    pub fn new(user: impl Into<String>, shard: impl Into<String>) -> Self {
-        Self {
-            user: user.into(),
-            shard: shard.into(),
-        }
-    }
-}
-
-/// Configuration for concurrency limits
-#[derive(Debug, Clone)]
-pub struct LimitConfig {
-    /// Maximum concurrent requests per key
-    pub max_concurrent: usize,
-    /// Maximum queue size (requests waiting for a slot)
-    pub max_queue_size: usize,
-    /// Timeout for waiting in queue
-    pub queue_timeout: Duration,
-    /// Whether to enable rate limiting
-    pub enabled: bool,
-}
-
-impl Default for LimitConfig {
-    fn default() -> Self {
-        Self {
-            max_concurrent: 10,
-            max_queue_size: 100,
-            queue_timeout: Duration::from_secs(30),
-            enabled: true,
-        }
-    }
-}
-
-impl From<&CircuitConfig> for LimitConfig {
-    fn from(config: &CircuitConfig) -> Self {
-        Self {
-            max_concurrent: config.max_concurrent_per_user_shard,
-            max_queue_size: config.queue_size,
-            queue_timeout: Duration::from_millis(config.queue_timeout_ms),
-            enabled: config.enabled,
-        }
-    }
-}
-
-impl From<CircuitConfig> for LimitConfig {
-    fn from(config: CircuitConfig) -> Self {
-        Self::from(&config)
-    }
-}
-
-/// State for a single limit key
-pub struct ConcurrencyLimit {
-    /// Semaphore for controlling concurrency
-    semaphore: Arc<Semaphore>,
-    /// Current number of waiting requests
-    waiting: AtomicUsize,
-    /// Maximum queue size
-    max_queue: usize,
-}
-
-impl ConcurrencyLimit {
-    fn new(max_concurrent: usize, max_queue: usize) -> Self {
-        Self {
-            semaphore: Arc::new(Semaphore::new(max_concurrent)),
-            waiting: AtomicUsize::new(0),
-            max_queue,
-        }
-    }
-
-    /// Current number of active (acquired) permits
-    pub fn active_count(&self) -> usize {
-        self.semaphore.available_permits()
-    }
-
-    /// Current number of waiting requests
-    pub fn waiting_count(&self) -> usize {
-        self.waiting.load(Ordering::Relaxed)
-    }
-}
-
-/// RAII permit that releases the slot when dropped
-pub struct LimitPermit {
-    _permit: OwnedSemaphorePermit,
-    key: LimitKey,
-}
-
-impl LimitPermit {
-    fn new(permit: OwnedSemaphorePermit, key: LimitKey) -> Self {
-        Self {
-            _permit: permit,
-            key,
-        }
-    }
-
-    /// Get the key this permit belongs to
-    pub fn key(&self) -> &LimitKey {
-        &self.key
-    }
-}
+use crate::config::LimiterConfig;
 
 /// Error type for rate limiting
 #[derive(Debug, thiserror::Error)]
@@ -130,76 +25,125 @@ pub enum LimitError {
     Disabled,
 }
 
-/// Concurrency controller for rate limiting
-pub struct ConcurrencyController {
-    /// Limits per key
-    limits: DashMap<LimitKey, Arc<ConcurrencyLimit>>,
-    /// Configuration
-    config: LimitConfig,
-    /// Statistics
-    stats: ControllerStats,
+/// RAII permit that releases the slot when dropped
+pub struct Permit {
+    _permit: OwnedSemaphorePermit,
 }
 
-/// Controller statistics
+impl Permit {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self { _permit: permit }
+    }
+}
+
+/// Simple rate limiter for a single DBInstance
+///
+/// This limiter is designed to be embedded directly in a DBInstance,
+/// eliminating the need for dynamic key management.
+///
+/// # Example
+///
+/// ```ignore
+/// let limiter = Limiter::new(LimiterConfig::default());
+///
+/// // Acquire permit before executing query
+/// let permit = limiter.acquire().await?;
+///
+/// // Execute query...
+///
+/// // Permit is automatically released when dropped
+/// drop(permit);
+/// ```
+pub struct Limiter {
+    /// Semaphore for controlling concurrency
+    semaphore: Arc<Semaphore>,
+    /// Current number of waiting requests
+    waiting: AtomicUsize,
+    /// Configuration
+    config: LimiterConfig,
+    /// Statistics
+    stats: LimiterStats,
+}
+
+/// Limiter statistics
 #[derive(Default)]
-struct ControllerStats {
+struct LimiterStats {
     acquired: AtomicUsize,
     rejected_full: AtomicUsize,
     rejected_timeout: AtomicUsize,
 }
 
-impl ConcurrencyController {
-    /// Create a new controller with the given configuration
-    pub fn new(config: LimitConfig) -> Self {
+impl Limiter {
+    /// Create a new limiter with the given configuration
+    pub fn new(config: LimiterConfig) -> Self {
         Self {
-            limits: DashMap::new(),
+            semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
+            waiting: AtomicUsize::new(0),
             config,
-            stats: ControllerStats::default(),
+            stats: LimiterStats::default(),
         }
     }
 
-    /// Try to acquire a permit for the given key
+    /// Create a limiter with default configuration
+    pub fn with_defaults() -> Self {
+        Self::new(LimiterConfig::default())
+    }
+
+    /// Check if rate limiting is enabled
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    /// Get the maximum concurrent requests allowed
+    pub fn max_concurrent(&self) -> usize {
+        self.config.max_concurrent
+    }
+
+    /// Get the number of available permits
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    /// Get the number of active (acquired) permits
+    pub fn active_count(&self) -> usize {
+        self.config.max_concurrent - self.semaphore.available_permits()
+    }
+
+    /// Get the number of waiting requests
+    pub fn waiting_count(&self) -> usize {
+        self.waiting.load(Ordering::Relaxed)
+    }
+
+    /// Acquire a permit for executing a request
     ///
     /// Returns a permit that must be held while the request is being processed.
     /// The permit is automatically released when dropped.
-    pub async fn acquire(&self, key: LimitKey) -> Result<LimitPermit, LimitError> {
+    ///
+    /// # Errors
+    ///
+    /// - `LimitError::Disabled` - Rate limiting is disabled
+    /// - `LimitError::QueueFull` - Too many requests waiting
+    /// - `LimitError::Timeout` - Timed out waiting for a permit
+    pub async fn acquire(&self) -> Result<Permit, LimitError> {
         if !self.config.enabled {
             return Err(LimitError::Disabled);
         }
 
-        // Get or create limit for this key
-        let limit = self
-            .limits
-            .entry(key.clone())
-            .or_insert_with(|| {
-                Arc::new(ConcurrencyLimit::new(
-                    self.config.max_concurrent,
-                    self.config.max_queue_size,
-                ))
-            })
-            .clone();
-
         // Fast path: try to acquire immediately without waiting
-        let semaphore = limit.semaphore.clone();
-        if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+        if let Ok(permit) = self.semaphore.clone().try_acquire_owned() {
             self.stats.acquired.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                user = %key.user,
-                shard = %key.shard,
-                "Acquired rate limit permit (fast path)"
-            );
-            return Ok(LimitPermit::new(permit, key));
+            debug!("Acquired rate limit permit (fast path)");
+            return Ok(Permit::new(permit));
         }
 
         // Slow path: need to wait, check if queue is full first
-        let current_waiting = limit.waiting.fetch_add(1, Ordering::SeqCst);
+        let current_waiting = self.waiting.fetch_add(1, Ordering::SeqCst);
         if current_waiting >= self.config.max_queue_size {
-            limit.waiting.fetch_sub(1, Ordering::SeqCst);
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
             self.stats.rejected_full.fetch_add(1, Ordering::Relaxed);
             warn!(
-                user = %key.user,
-                shard = %key.shard,
                 max_queue = self.config.max_queue_size,
+                current_waiting,
                 "Rate limit queue full"
             );
             return Err(LimitError::QueueFull {
@@ -208,110 +152,175 @@ impl ConcurrencyController {
         }
 
         // Try to acquire semaphore with timeout
-        let result = timeout(
-            self.config.queue_timeout,
-            semaphore.acquire_owned(),
-        )
-        .await;
+        let queue_timeout = Duration::from_millis(self.config.queue_timeout_ms);
+        let result = timeout(queue_timeout, self.semaphore.clone().acquire_owned()).await;
 
         // Decrement waiting count
-        limit.waiting.fetch_sub(1, Ordering::SeqCst);
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
 
         match result {
             Ok(Ok(permit)) => {
                 self.stats.acquired.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    user = %key.user,
-                    shard = %key.shard,
-                    "Acquired rate limit permit (slow path)"
-                );
-                Ok(LimitPermit::new(permit, key))
+                debug!("Acquired rate limit permit (slow path)");
+                Ok(Permit::new(permit))
             }
             Ok(Err(_)) => {
                 // Semaphore closed - shouldn't happen
-                Err(LimitError::Timeout {
-                    timeout: self.config.queue_timeout,
-                })
+                Err(LimitError::Timeout { timeout: queue_timeout })
             }
             Err(_) => {
                 self.stats.rejected_timeout.fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    user = %key.user,
-                    shard = %key.shard,
-                    timeout = ?self.config.queue_timeout,
-                    "Rate limit timeout"
-                );
-                Err(LimitError::Timeout {
-                    timeout: self.config.queue_timeout,
-                })
+                warn!(timeout = ?queue_timeout, "Rate limit timeout");
+                Err(LimitError::Timeout { timeout: queue_timeout })
             }
         }
     }
 
     /// Try to acquire a permit without waiting
     ///
-    /// Returns None if no permit is available.
-    pub fn try_acquire(&self, key: LimitKey) -> Option<LimitPermit> {
+    /// Returns `None` if no permit is available or rate limiting is disabled.
+    pub fn try_acquire(&self) -> Option<Permit> {
         if !self.config.enabled {
             return None;
         }
 
-        let limit = self
-            .limits
-            .entry(key.clone())
-            .or_insert_with(|| {
-                Arc::new(ConcurrencyLimit::new(
-                    self.config.max_concurrent,
-                    self.config.max_queue_size,
-                ))
-            })
-            .clone();
-
-        match limit.semaphore.clone().try_acquire_owned() {
+        match self.semaphore.clone().try_acquire_owned() {
             Ok(permit) => {
                 self.stats.acquired.fetch_add(1, Ordering::Relaxed);
-                Some(LimitPermit::new(permit, key))
+                Some(Permit::new(permit))
             }
             Err(_) => None,
         }
     }
 
-    /// Get statistics
-    pub fn stats(&self) -> ConcurrencyStats {
-        ConcurrencyStats {
+    /// Get limiter statistics
+    pub fn stats(&self) -> Stats {
+        Stats {
             total_acquired: self.stats.acquired.load(Ordering::Relaxed),
             total_rejected_full: self.stats.rejected_full.load(Ordering::Relaxed),
             total_rejected_timeout: self.stats.rejected_timeout.load(Ordering::Relaxed),
-            active_keys: self.limits.len(),
+            current_active: self.active_count(),
+            current_waiting: self.waiting_count(),
         }
-    }
-
-    /// Get the limit for a specific key
-    pub fn get_limit(&self, key: &LimitKey) -> Option<Arc<ConcurrencyLimit>> {
-        self.limits.get(key).map(|r| r.value().clone())
-    }
-
-    /// Get or create the limit for a specific key
-    pub fn get_or_create_limit(&self, key: LimitKey) -> Arc<ConcurrencyLimit> {
-        self.limits
-            .entry(key)
-            .or_insert_with(|| {
-                Arc::new(ConcurrencyLimit::new(
-                    self.config.max_concurrent,
-                    self.config.max_queue_size,
-                ))
-            })
-            .clone()
     }
 }
 
-/// Controller statistics
+/// Public statistics for a limiter
 #[derive(Debug, Clone)]
-pub struct ConcurrencyStats {
+pub struct Stats {
     pub total_acquired: usize,
     pub total_rejected_full: usize,
     pub total_rejected_timeout: usize,
-    pub active_keys: usize,
+    pub current_active: usize,
+    pub current_waiting: usize,
+}
+
+// ============================================================================
+// Legacy support: Keep old types for backward compatibility during migration
+// ============================================================================
+
+/// Legacy: Key for identifying rate limit scope
+/// Deprecated: Use Limiter embedded in DBInstance instead
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LimitKey {
+    pub user: String,
+    pub shard: String,
+}
+
+impl LimitKey {
+    pub fn new(user: impl Into<String>, shard: impl Into<String>) -> Self {
+        Self {
+            user: user.into(),
+            shard: shard.into(),
+        }
+    }
+}
+
+/// Legacy: RAII permit with key
+/// Deprecated: Use Permit instead
+pub struct LimitPermit {
+    _permit: OwnedSemaphorePermit,
+    key: LimitKey,
+}
+
+impl LimitPermit {
+    fn new(permit: OwnedSemaphorePermit, key: LimitKey) -> Self {
+        Self { _permit: permit, key }
+    }
+
+    pub fn key(&self) -> &LimitKey {
+        &self.key
+    }
+}
+
+/// Legacy: Configuration for concurrency limits
+/// Deprecated: Use LimiterConfig instead
+#[derive(Debug, Clone)]
+pub struct LimitConfig {
+    pub max_concurrent: usize,
+    pub max_queue_size: usize,
+    pub queue_timeout: Duration,
+    pub enabled: bool,
+}
+
+impl Default for LimitConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 100,
+            max_queue_size: 50,
+            queue_timeout: Duration::from_secs(5),
+            enabled: true,
+        }
+    }
+}
+
+impl From<&crate::config::CircuitConfig> for LimitConfig {
+    fn from(config: &crate::config::CircuitConfig) -> Self {
+        Self {
+            max_concurrent: config.max_concurrent_per_user_shard,
+            max_queue_size: config.queue_size,
+            queue_timeout: Duration::from_millis(config.queue_timeout_ms),
+            enabled: config.enabled,
+        }
+    }
+}
+
+impl From<crate::config::CircuitConfig> for LimitConfig {
+    fn from(config: crate::config::CircuitConfig) -> Self {
+        Self::from(&config)
+    }
+}
+
+/// Legacy: Concurrency controller with dynamic key management
+/// Deprecated: Use Limiter embedded in DBInstance instead
+pub struct ConcurrencyController {
+    limiter: Limiter,
+}
+
+impl ConcurrencyController {
+    pub fn new(config: LimitConfig) -> Self {
+        let limiter_config = LimiterConfig {
+            enabled: config.enabled,
+            max_concurrent: config.max_concurrent,
+            max_queue_size: config.max_queue_size,
+            queue_timeout_ms: config.queue_timeout.as_millis() as u64,
+        };
+        Self {
+            limiter: Limiter::new(limiter_config),
+        }
+    }
+
+    /// Acquire a permit (key is ignored in new implementation)
+    pub async fn acquire(&self, key: LimitKey) -> Result<LimitPermit, LimitError> {
+        let permit = self.limiter.acquire().await?;
+        // Convert internal permit to legacy LimitPermit
+        // Note: We need to re-acquire since we can't move out of Permit
+        let owned = self.limiter.semaphore.clone().try_acquire_owned()
+            .map_err(|_| LimitError::QueueFull { max: 0 })?;
+        // Release the permit we just acquired
+        drop(permit);
+        Ok(LimitPermit::new(owned, key))
+    }
 }
 
 #[cfg(test)]
@@ -320,81 +329,78 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_acquire_release() {
-        let config = LimitConfig {
+        let config = LimiterConfig {
             max_concurrent: 2,
             max_queue_size: 10,
-            queue_timeout: Duration::from_secs(1),
+            queue_timeout_ms: 1000,
             enabled: true,
         };
-        let controller = ConcurrencyController::new(config);
-
-        let key = LimitKey::new("user1", "shard1");
+        let limiter = Limiter::new(config);
 
         // Acquire first permit
-        let permit1 = controller.acquire(key.clone()).await.unwrap();
-        assert_eq!(permit1.key().user, "user1");
+        let permit1 = limiter.acquire().await.unwrap();
+        assert_eq!(limiter.active_count(), 1);
 
         // Acquire second permit
-        let permit2 = controller.acquire(key.clone()).await.unwrap();
+        let permit2 = limiter.acquire().await.unwrap();
+        assert_eq!(limiter.active_count(), 2);
 
         // Drop permits
         drop(permit1);
+        assert_eq!(limiter.active_count(), 1);
         drop(permit2);
+        assert_eq!(limiter.active_count(), 0);
 
-        let stats = controller.stats();
+        let stats = limiter.stats();
         assert_eq!(stats.total_acquired, 2);
     }
 
     #[tokio::test]
     async fn test_try_acquire() {
-        let config = LimitConfig {
+        let config = LimiterConfig {
             max_concurrent: 1,
             max_queue_size: 10,
-            queue_timeout: Duration::from_secs(1),
+            queue_timeout_ms: 1000,
             enabled: true,
         };
-        let controller = ConcurrencyController::new(config);
-
-        let key = LimitKey::new("user1", "shard1");
+        let limiter = Limiter::new(config);
 
         // First try_acquire should succeed
-        let permit = controller.try_acquire(key.clone()).unwrap();
+        let permit = limiter.try_acquire().unwrap();
+        assert_eq!(limiter.active_count(), 1);
 
         // Second try_acquire should fail (no waiting)
-        assert!(controller.try_acquire(key.clone()).is_none());
+        assert!(limiter.try_acquire().is_none());
 
         // After dropping, should succeed again
         drop(permit);
-        assert!(controller.try_acquire(key).is_some());
+        assert!(limiter.try_acquire().is_some());
     }
 
     #[tokio::test]
     async fn test_queue_full() {
-        let config = LimitConfig {
+        let config = LimiterConfig {
             max_concurrent: 1,
             max_queue_size: 1,
-            queue_timeout: Duration::from_millis(100),
+            queue_timeout_ms: 100,
             enabled: true,
         };
-        let controller = Arc::new(ConcurrencyController::new(config));
-
-        let key = LimitKey::new("user1", "shard1");
+        let limiter = Arc::new(Limiter::new(config));
 
         // Acquire first permit
-        let _permit1 = controller.acquire(key.clone()).await.unwrap();
+        let _permit1 = limiter.acquire().await.unwrap();
 
         // Start one waiting request
-        let controller_clone = controller.clone();
-        let key_clone = key.clone();
+        let limiter_clone = limiter.clone();
         let handle = tokio::spawn(async move {
-            controller_clone.acquire(key_clone).await
+            limiter_clone.acquire().await
         });
 
         // Give it time to start waiting
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         // Try another acquire - should fail with QueueFull
-        let result = controller.acquire(key).await;
+        let result = limiter.acquire().await;
         assert!(matches!(result, Err(LimitError::QueueFull { .. })));
 
         // Clean up
@@ -403,119 +409,104 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout() {
-        let config = LimitConfig {
+        let config = LimiterConfig {
             max_concurrent: 1,
             max_queue_size: 10,
-            queue_timeout: Duration::from_millis(50),
+            queue_timeout_ms: 50,
             enabled: true,
         };
-        let controller = ConcurrencyController::new(config);
-
-        let key = LimitKey::new("user1", "shard1");
+        let limiter = Limiter::new(config);
 
         // Acquire and hold permit
-        let _permit = controller.acquire(key.clone()).await.unwrap();
+        let _permit = limiter.acquire().await.unwrap();
 
         // Second acquire should timeout
-        let result = controller.acquire(key).await;
+        let result = limiter.acquire().await;
         assert!(matches!(result, Err(LimitError::Timeout { .. })));
     }
 
     #[tokio::test]
     async fn test_disabled() {
-        let config = LimitConfig {
+        let config = LimiterConfig {
             enabled: false,
             ..Default::default()
         };
-        let controller = ConcurrencyController::new(config);
+        let limiter = Limiter::new(config);
 
-        let key = LimitKey::new("user1", "shard1");
-        let result = controller.acquire(key).await;
+        let result = limiter.acquire().await;
         assert!(matches!(result, Err(LimitError::Disabled)));
-    }
-
-    #[tokio::test]
-    async fn test_different_keys() {
-        let config = LimitConfig {
-            max_concurrent: 1,
-            max_queue_size: 10,
-            queue_timeout: Duration::from_secs(1),
-            enabled: true,
-        };
-        let controller = ConcurrencyController::new(config);
-
-        let key1 = LimitKey::new("user1", "shard1");
-        let key2 = LimitKey::new("user2", "shard1");
-        let key3 = LimitKey::new("user1", "shard2");
-
-        // All should succeed because they're different keys
-        let _permit1 = controller.acquire(key1).await.unwrap();
-        let _permit2 = controller.acquire(key2).await.unwrap();
-        let _permit3 = controller.acquire(key3).await.unwrap();
-
-        let stats = controller.stats();
-        assert_eq!(stats.total_acquired, 3);
-        assert_eq!(stats.active_keys, 3);
     }
 
     #[tokio::test]
     async fn test_zero_queue_size_first_acquire_succeeds() {
         // With queue_size=0, the first acquire should still succeed
         // because it doesn't need to wait (permit is available)
-        let config = LimitConfig {
+        let config = LimiterConfig {
             max_concurrent: 1,
             max_queue_size: 0,
-            queue_timeout: Duration::from_millis(100),
+            queue_timeout_ms: 100,
             enabled: true,
         };
-        let controller = ConcurrencyController::new(config);
-
-        let key = LimitKey::new("user1", "shard1");
+        let limiter = Limiter::new(config);
 
         // First acquire should succeed (permit available, no waiting needed)
-        let permit = controller.acquire(key.clone()).await;
+        let permit = limiter.acquire().await;
         assert!(permit.is_ok(), "First acquire should succeed with available permit");
 
         // Second acquire should fail with QueueFull (no queue allowed)
-        let result = controller.acquire(key).await;
+        let result = limiter.acquire().await;
         assert!(matches!(result, Err(LimitError::QueueFull { .. })));
     }
 
     #[tokio::test]
     async fn test_fast_path_no_queue_increment() {
         // When permits are available, we should not increment waiting count
-        let config = LimitConfig {
+        let config = LimiterConfig {
             max_concurrent: 2,
             max_queue_size: 1,
-            queue_timeout: Duration::from_millis(100),
+            queue_timeout_ms: 100,
             enabled: true,
         };
-        let controller = ConcurrencyController::new(config);
-
-        let key = LimitKey::new("user1", "shard1");
+        let limiter = Arc::new(Limiter::new(config));
 
         // Acquire both permits - should not increment waiting count
-        let _permit1 = controller.acquire(key.clone()).await.unwrap();
-        let _permit2 = controller.acquire(key.clone()).await.unwrap();
+        let _permit1 = limiter.acquire().await.unwrap();
+        let _permit2 = limiter.acquire().await.unwrap();
+        assert_eq!(limiter.waiting_count(), 0);
 
         // Third acquire should be able to wait (queue_size=1)
-        // This tests that first two acquires didn't consume queue slots
-        let controller_clone = Arc::new(controller);
-        let controller_for_spawn = controller_clone.clone();
-        let key_clone = key.clone();
-        
+        let limiter_clone = limiter.clone();
         let handle = tokio::spawn(async move {
-            controller_for_spawn.acquire(key_clone).await
+            limiter_clone.acquire().await
         });
 
         // Give it time to start waiting
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         // Fourth acquire should fail with QueueFull (queue is now at capacity)
-        let result = controller_clone.acquire(key).await;
+        let result = limiter.acquire().await;
         assert!(matches!(result, Err(LimitError::QueueFull { .. })));
 
         // Clean up
         drop(handle);
+    }
+
+    #[tokio::test]
+    async fn test_stats() {
+        let config = LimiterConfig {
+            max_concurrent: 2,
+            max_queue_size: 10,
+            queue_timeout_ms: 1000,
+            enabled: true,
+        };
+        let limiter = Limiter::new(config);
+
+        let _permit1 = limiter.acquire().await.unwrap();
+        let _permit2 = limiter.acquire().await.unwrap();
+
+        let stats = limiter.stats();
+        assert_eq!(stats.total_acquired, 2);
+        assert_eq!(stats.current_active, 2);
+        assert_eq!(stats.current_waiting, 0);
     }
 }

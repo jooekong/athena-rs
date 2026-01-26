@@ -294,6 +294,54 @@ impl Session {
             return Ok(());
         }
 
+        // Handle SET statements - intercept to prevent connection pollution
+        if analysis.stmt_type == StatementType::Set {
+            // Parse SET statement to extract variable and value
+            if let Some((var_name, var_value)) = self.parse_set_statement(sql) {
+                // Check if this SET should be forwarded (transaction-critical)
+                let should_forward = self.state.in_transaction
+                    && (var_name.eq_ignore_ascii_case("autocommit")
+                        || var_name.to_lowercase().starts_with("transaction"));
+
+                if should_forward {
+                    // Forward to backend for transaction-bound connections
+                    debug!(
+                        session_id = self.id,
+                        var = %var_name,
+                        value = %var_value,
+                        "Forwarding SET to transaction connection"
+                    );
+                    self.execute_with_transaction(client, original_packet.clone())
+                        .await?;
+                } else {
+                    // Intercept: store locally and return mock OK
+                    debug!(
+                        session_id = self.id,
+                        var = %var_name,
+                        value = %var_value,
+                        "Intercepted SET command (not forwarded to backend)"
+                    );
+                    self.state.set_session_var(var_name, var_value);
+                    let ok = OkPacket::new();
+                    client
+                        .send(ok.encode(1, self.state.capability_flags))
+                        .await?;
+                }
+            } else {
+                // Couldn't parse SET, just return OK to avoid pollution
+                debug!(
+                    session_id = self.id,
+                    sql = %sql,
+                    "SET command not parsed, returning mock OK"
+                );
+                let ok = OkPacket::new();
+                client
+                    .send(ok.encode(1, self.state.capability_flags))
+                    .await?;
+            }
+            return Ok(());
+        }
+
         // Route the query
         let route_start = Instant::now();
         let route_result = self.router.route(sql, &analysis, self.state.in_transaction);
@@ -886,6 +934,76 @@ impl Session {
         }
 
         Ok(())
+    }
+
+    /// Parse a SET statement to extract variable name and value
+    ///
+    /// Handles formats like:
+    /// - SET var = value
+    /// - SET var := value
+    /// - SET @@session.var = value
+    /// - SET NAMES utf8mb4
+    ///
+    /// Returns (variable_name, value) or None if parsing fails
+    fn parse_set_statement(&self, sql: &str) -> Option<(String, String)> {
+        let sql = sql.trim();
+        let upper = sql.to_uppercase();
+
+        // Must start with SET
+        if !upper.starts_with("SET ") {
+            return None;
+        }
+
+        // Handle SET NAMES/CHARSET specially
+        if upper.starts_with("SET NAMES") {
+            let value = sql[9..].trim().trim_matches(|c| c == '\'' || c == '"');
+            return Some(("names".to_string(), value.to_string()));
+        }
+        if upper.starts_with("SET CHARSET") || upper.starts_with("SET CHARACTER SET") {
+            let offset = if upper.starts_with("SET CHARACTER SET") {
+                17
+            } else {
+                11
+            };
+            let value = sql[offset..].trim().trim_matches(|c| c == '\'' || c == '"');
+            return Some(("charset".to_string(), value.to_string()));
+        }
+
+        // Skip "SET " prefix (4 chars)
+        let rest = sql[4..].trim();
+
+        // Handle @@session.var or @@var
+        let rest = if rest.starts_with("@@session.") {
+            &rest[10..]
+        } else if rest.starts_with("@@global.") {
+            &rest[9..]
+        } else if rest.starts_with("@@") {
+            &rest[2..]
+        } else {
+            rest
+        };
+
+        // Find = or :=
+        let (var_part, value_part) = if let Some(pos) = rest.find(":=") {
+            (&rest[..pos], &rest[pos + 2..])
+        } else if let Some(pos) = rest.find('=') {
+            (&rest[..pos], &rest[pos + 1..])
+        } else {
+            return None;
+        };
+
+        let var_name = var_part.trim().to_string();
+        let var_value = value_part
+            .trim()
+            .trim_end_matches(';')
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string();
+
+        if var_name.is_empty() {
+            return None;
+        }
+
+        Some((var_name, var_value))
     }
 }
 

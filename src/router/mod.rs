@@ -1,9 +1,11 @@
 mod rule;
 mod rw_split;
+mod selector;
 mod shard;
 
 pub use rule::{RouterConfig, ShardingRule};
 pub use rw_split::{RouteTarget, RwSplitter};
+pub use selector::{FirstSelector, InstanceSelector, ReadWriteRouter, RoundRobinSelector};
 pub use shard::{ShardAlgorithm, ShardCalculator};
 
 use std::collections::HashMap;

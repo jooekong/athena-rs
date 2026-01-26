@@ -75,23 +75,64 @@ Client: COMMIT    → Proxy: 发送 COMMIT 到后端, 清理事务状态
 - `max_age`: 连接最大存活时间
 - `max_idle_time`: 最大空闲时间
 
-### 熔断限流设计
+### 多租户架构 (Group/DBGroup/DBInstance)
 
-- 按 `(user, shard)` 粒度控制并发
-- 超过限制进入等待队列
-- 队列满或超时 → 拒绝请求（返回 MySQL 错误，不断开连接）
+```
+┌─────────────────────────────────────────────────────┐
+│ Group (客户端视角的逻辑 DB, 1:1 对应租户)              │
+│   - 对客户端暴露为一个 "数据库"                        │
+│   - 包含分片规则、路由配置等                          │
+└───────────────────────┬─────────────────────────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│   DBGroup 0   │ │   DBGroup 1   │ │   DBGroup 2   │  ← 后端集群 (shard)
+└───────┬───────┘ └───────────────┘ └───────────────┘
+        │
+   ┌────┴────┐
+   ▼         ▼
+┌──────┐  ┌──────┐
+│Master│  │Slave │   ← DBInstance (每个有独立 Limiter)
+└──────┘  └──────┘
+```
+
+**配置示例：**
+```toml
+[[groups]]
+name = "tenant_a"
+
+[[groups.db_groups]]
+shard_id = "shard_0"
+
+[[groups.db_groups.instances]]
+host = "mysql-1"
+port = 3306
+role = "master"
+
+[groups.db_groups.instances.limiter]
+max_concurrent = 100
+max_queue_size = 50
+```
+
+### 限流设计 (Limiter)
+
+**设计原则：**
+- 每个 DBInstance 内嵌独立的 Limiter
+- 无需动态 key 管理 (DashMap)，简化实现
+- 保护每个 MySQL 实例不被打爆
 
 **获取流程（双路径）：**
 1. **快速路径**：`try_acquire_owned` 尝试立即获取，成功则返回（不计入等待）
 2. **慢速路径**：快速路径失败后，检查队列是否已满，未满则入队等待
 
-**限流配置：**
+**限流配置（per DBInstance）：**
 ```toml
-[circuit]
-enabled = true                      # 开关
-max_concurrent_per_user_shard = 10  # 单键最大并发
-queue_size = 100                    # 最大排队数
-queue_timeout_ms = 5000             # 排队超时（毫秒）
+[groups.db_groups.instances.limiter]
+enabled = true          # 开关
+max_concurrent = 100    # 最大并发
+max_queue_size = 50     # 最大排队数
+queue_timeout_ms = 5000 # 排队超时（毫秒）
 ```
 
 **限流范围：**
@@ -104,6 +145,74 @@ queue_timeout_ms = 5000             # 排队超时（毫秒）
 - 队列满：返回 `ERROR 1040 (08004): Too many connections`
 - 超时：返回 `ERROR 1205 (HY000): Rate limit timeout`
 - 限流失败不断开连接，客户端可继续发送其他查询
+
+### 读写分离 (Read-Write Splitting)
+
+**路由规则：**
+- `SELECT/SHOW` → Slave（只读查询走从库）
+- `INSERT/UPDATE/DELETE` → Master（写操作走主库）
+- 事务内所有查询 → Master（保证事务一致性）
+- 非查询命令（PING、InitDb）→ Master
+
+**实例选择策略 (`src/router/selector.rs`)：**
+```rust
+/// 可扩展的实例选择策略
+pub trait InstanceSelector: Send + Sync {
+    fn select<'a>(&self, instances: &[&'a DBInstanceConfig]) -> Option<&'a DBInstanceConfig>;
+}
+
+// 内置策略
+pub struct FirstSelector;        // 选第一个（默认主库策略）
+pub struct RoundRobinSelector;   // 轮询（默认从库策略）
+```
+
+**Fallback 机制：**
+- 无从库时自动 fallback 到主库
+- `select_with_target()` 返回实际使用的 target
+
+**多主多从支持：**
+```
+DBGroup
+├── Master 1 (primary, FirstSelector 默认选中)
+├── Master 2
+├── Slave 1 ──┐
+├── Slave 2 ──┼── RoundRobinSelector 轮询
+└── Slave 3 ──┘
+```
+
+### 连接污染防护
+
+**问题：** `SET` 命令会改变 MySQL 连接的 session 状态，导致后续使用该连接的请求受影响。
+
+**解决方案：** 拦截 SET 命令，本地存储而不发送到后端
+
+**拦截的命令：**
+- `SET var = value`
+- `SET @@session.var = value`
+- `SET NAMES charset`
+- `SET CHARSET charset`
+
+**例外（需要转发的命令）：**
+- 事务内的 `SET autocommit`
+- 事务内的 `SET TRANSACTION ISOLATION LEVEL`
+
+**实现：**
+```rust
+// SessionState 存储拦截的变量
+session_vars: HashMap<String, String>
+
+// Session 处理 SET
+if analysis.stmt_type == StatementType::Set {
+    if should_forward {
+        // 事务关键命令，转发到后端
+        self.execute_with_transaction(client, packet).await?;
+    } else {
+        // 拦截，返回 mock OK
+        self.state.set_session_var(var_name, var_value);
+        client.send(OkPacket::new().encode(...)).await?;
+    }
+}
+```
 
 ---
 

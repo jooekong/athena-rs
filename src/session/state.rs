@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 /// Session state tracking
 #[derive(Debug, Clone, Default)]
 pub struct SessionState {
@@ -13,6 +15,11 @@ pub struct SessionState {
     pub capability_flags: u32,
     /// Character set
     pub character_set: u8,
+    /// Intercepted session variables (not sent to backend)
+    ///
+    /// These are SET commands that are intercepted to prevent connection pollution.
+    /// The proxy returns OK to the client but doesn't forward to the backend.
+    session_vars: HashMap<String, String>,
 }
 
 impl SessionState {
@@ -48,5 +55,20 @@ impl SessionState {
     /// Change current database
     pub fn change_database(&mut self, db: String) {
         self.database = Some(db);
+    }
+
+    /// Set a session variable (intercepted, not sent to backend)
+    pub fn set_session_var(&mut self, name: String, value: String) {
+        self.session_vars.insert(name.to_lowercase(), value);
+    }
+
+    /// Get a session variable
+    pub fn get_session_var(&self, name: &str) -> Option<&String> {
+        self.session_vars.get(&name.to_lowercase())
+    }
+
+    /// Check if a session variable is set
+    pub fn has_session_var(&self, name: &str) -> bool {
+        self.session_vars.contains_key(&name.to_lowercase())
     }
 }

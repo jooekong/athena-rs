@@ -1,6 +1,7 @@
 mod limiter;
 
-pub use limiter::{
-    ConcurrencyController, ConcurrencyLimit, ConcurrencyStats, LimitConfig, LimitError, LimitKey,
-    LimitPermit,
-};
+// New simplified API
+pub use limiter::{Limiter, LimitError, Permit, Stats};
+
+// Legacy API (for backward compatibility during migration)
+pub use limiter::{ConcurrencyController, LimitConfig, LimitKey, LimitPermit};
