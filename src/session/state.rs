@@ -9,8 +9,6 @@ pub struct SessionState {
     pub in_transaction: bool,
     /// Shard bound to current transaction (if any)
     pub transaction_shard: Option<String>,
-    /// Whether BEGIN was sent to backend (transaction actually started on backend)
-    pub transaction_started: bool,
     /// Client capability flags
     pub capability_flags: u32,
     /// Character set
@@ -30,11 +28,10 @@ impl SessionState {
         self.character_set = charset;
     }
 
-    /// Start a transaction (client sent BEGIN, but not yet sent to backend)
+    /// Start a transaction
     pub fn begin_transaction(&mut self) {
         self.in_transaction = true;
         self.transaction_shard = None; // Will be bound on first query
-        self.transaction_started = false; // BEGIN not yet sent to backend
     }
 
     /// Bind transaction to a specific shard
@@ -42,16 +39,10 @@ impl SessionState {
         self.transaction_shard = Some(shard);
     }
 
-    /// Mark that BEGIN was sent to backend
-    pub fn mark_transaction_started(&mut self) {
-        self.transaction_started = true;
-    }
-
     /// End a transaction
     pub fn end_transaction(&mut self) {
         self.in_transaction = false;
         self.transaction_shard = None;
-        self.transaction_started = false;
     }
 
     /// Change current database

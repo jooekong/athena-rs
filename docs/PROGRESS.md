@@ -288,10 +288,10 @@ done
 
 **修复的问题：**
 
-6. **[Critical] 事务语义错误**
-   - 问题：客户端发送 BEGIN 后，代理只在本地标记事务状态，未向后端发送 BEGIN
-   - 修复：首次事务内查询前，向后端发送 BEGIN 并吞掉 OK；添加 `transaction_started` 标志位
-   - 文件：`src/session/mod.rs`, `src/session/state.rs`
+6. **[Critical] 事务语义修正**
+   - 问题：客户端发送 BEGIN 后，代理只在本地标记事务状态
+   - 修复：事务连接创建时设置 `autocommit=0`，无需显式 BEGIN，只需 COMMIT/ROLLBACK
+   - 文件：`src/pool/transaction.rs`（添加 `set_autocommit_off`）
 
 7. **[High] 限流队列边界错误**
    - 问题：`queue_size=0` 时，首个请求也会因 `0 >= 0` 判断被拒绝

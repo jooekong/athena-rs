@@ -33,6 +33,7 @@ impl TransactionPool {
     /// Get the bound connection for a session, or create a new one
     ///
     /// The backend_config determines which shard the transaction connects to.
+    /// The connection is created with autocommit=0 for transaction semantics.
     pub async fn get_or_create(
         &self,
         session_id: u32,
@@ -50,7 +51,37 @@ impl TransactionPool {
         debug!(session_id = session_id, host = %backend_config.host, "Creating bound connection for session");
         let mut conn = PooledConnection::connect(backend_config, database).await?;
         conn.acquire();
+
+        // Set autocommit=0 for transaction semantics
+        // This allows implicit transaction without explicit BEGIN
+        Self::set_autocommit_off(&mut conn).await?;
+
         bound.insert(session_id, conn);
+        Ok(())
+    }
+
+    /// Set autocommit=0 on the connection
+    async fn set_autocommit_off(conn: &mut PooledConnection) -> Result<(), ConnectionError> {
+        use crate::protocol::{is_err_packet, is_ok_packet, Packet};
+
+        let mut payload = vec![0x03]; // COM_QUERY
+        payload.extend_from_slice(b"SET autocommit=0");
+        let packet = Packet {
+            sequence_id: 0,
+            payload: payload.into(),
+        };
+
+        conn.send(packet).await?;
+
+        let response = conn.recv().await?;
+        if is_err_packet(&response.payload) {
+            return Err(ConnectionError::Protocol("Failed to set autocommit=0".into()));
+        }
+        if !is_ok_packet(&response.payload) {
+            return Err(ConnectionError::Protocol("Expected OK after SET autocommit".into()));
+        }
+
+        debug!("Set autocommit=0 on transaction connection");
         Ok(())
     }
 

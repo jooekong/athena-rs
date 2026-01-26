@@ -50,15 +50,15 @@ Backend MySQL
    - 连接绑定到 Session，直到 COMMIT/ROLLBACK
    - 保证事务内所有操作使用同一连接
 
-**事务语义（延迟开启）：**
+**事务语义（autocommit=0）：**
 ```
 Client: BEGIN     → Proxy: 本地标记 in_transaction=true, 返回 OK（不发后端）
-Client: SELECT... → Proxy: 绑定 shard, 创建连接, 发送 BEGIN, 吞掉 OK, 发送 SELECT
+Client: SELECT... → Proxy: 绑定 shard, 创建连接(autocommit=0), 发送 SELECT
 Client: COMMIT    → Proxy: 发送 COMMIT 到后端, 清理事务状态
 ```
 
+- 事务连接创建时设置 `autocommit=0`，无需显式 BEGIN
 - 若事务内无任何查询，COMMIT/ROLLBACK 只返回 OK，不发后端
-- `transaction_started` 标志位追踪 BEGIN 是否已发送到后端
 
 2. **无状态池 (StatelessPool)**
    - 普通读写查询
