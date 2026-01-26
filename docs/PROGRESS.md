@@ -252,14 +252,37 @@ done
 
 ---
 
-### Phase 6: 完善与优化 ⏳ 待开始
+### Phase 6: 完善与优化 ✅ 完成
 
-**待完成：**
-- [ ] 完整的错误处理和日志
-- [ ] Metrics 指标暴露
-- [ ] 优雅关闭
+**完成内容：**
+
+#### Phase 6.1: Tracing Spans 和 SQL 执行时间记录
+- [x] 添加 `#[instrument]` 宏到 `handle_query` 函数
+- [x] 记录解析时间 (`parse_time_us`)
+- [x] 记录路由时间 (`route_time_us`)
+- [x] 记录总查询时间 (`query_time_ms`)
+- [x] SQL 预览截断到 100 字符
+
+#### Phase 6.2: Prometheus Metrics 暴露
+- [x] 创建 `src/metrics/mod.rs` 模块
+- [x] 连接指标：`athena_connections_total/active/closed`
+- [x] 查询指标：`athena_queries_total`、`athena_query_duration_seconds`、`athena_query_errors_total`
+- [x] 连接池指标：`athena_pool_idle_connections`、`athena_pool_active_connections`
+- [x] 限流指标：`athena_rate_limit_acquired/rejected_*`
+- [x] 路由指标：`athena_queries_routed_total`、`athena_scatter_queries_total`
+- [x] HTTP 端点：`:PORT+1000` (`/metrics`, `/health`)
+
+#### Phase 6.3: 优雅关闭
+- [x] 监听 SIGTERM 和 SIGINT 信号
+- [x] 停止接受新连接
+- [x] 使用 `JoinSet` 追踪活跃会话
+- [x] 等待最多 30 秒让会话完成
+- [x] 超时后中止剩余会话
+
+**待完成（可选优化）：**
 - [ ] 配置热重载
 - [ ] 性能测试与优化
+- [ ] 集成测试（端到端）
 
 ---
 
@@ -269,7 +292,7 @@ done
 athena-rs/
 ├── Cargo.toml
 ├── src/
-│   ├── main.rs
+│   ├── main.rs                  # 入口，优雅关闭支持
 │   ├── config/
 │   │   ├── mod.rs
 │   │   └── schema.rs           # 包含 CircuitConfig
@@ -290,15 +313,17 @@ athena-rs/
 │   │   └── rw_split.rs
 │   ├── pool/
 │   │   ├── mod.rs
-│   │   ├── connection.rs
+│   │   ├── connection.rs       # 包含 backend_addr 追踪
 │   │   ├── stateless.rs
 │   │   ├── transaction.rs
 │   │   └── manager.rs
-│   ├── circuit/                 # Phase 5 新增
+│   ├── circuit/
 │   │   ├── mod.rs
 │   │   └── limiter.rs          # ConcurrencyController
+│   ├── metrics/                 # Phase 6 新增
+│   │   └── mod.rs              # Prometheus 指标 + HTTP 端点
 │   └── session/
-│       ├── mod.rs
+│       ├── mod.rs              # 带 tracing spans
 │       └── state.rs
 ├── config/
 │   └── athena.toml
@@ -310,7 +335,7 @@ athena-rs/
 ## 依赖
 
 ```toml
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "signal"] }
 sqlparser = { version = "0.40", features = ["visitor"] }
 mysql_common = "0.31"
 dashmap = "5"
@@ -325,4 +350,8 @@ sha1 = "0.10"
 rand = "0.8"
 anyhow = "1"
 futures = "0.3"
+prometheus = "0.13"           # Phase 6 新增
+hyper = { version = "1.1", features = ["server", "http1"] }  # Phase 6 新增
+hyper-util = { version = "0.1", features = ["tokio"] }       # Phase 6 新增
+http-body-util = "0.1"        # Phase 6 新增
 ```
