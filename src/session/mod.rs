@@ -3,6 +3,7 @@ mod state;
 pub use state::SessionState;
 
 use crate::circuit::{ConcurrencyController, LimitError, LimitKey, LimitPermit};
+use crate::metrics::metrics;
 use crate::parser::{SqlAnalyzer, StatementType};
 use crate::pool::{ConnectionError, PoolManager, PooledConnection, ShardId};
 use crate::protocol::{
@@ -12,9 +13,10 @@ use crate::protocol::{
 use crate::router::{RouteResult, RouteTarget, Router, RouterConfig};
 use futures::SinkExt;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use futures::StreamExt;
 
@@ -221,6 +223,7 @@ impl Session {
     }
 
     /// Handle SQL query with routing
+    #[instrument(skip(self, client, original_packet), fields(session_id = self.id, sql_preview = %truncate_sql(sql, 100)))]
     async fn handle_query<C>(
         &mut self,
         client: &mut Framed<C, PacketCodec>,
@@ -230,7 +233,10 @@ impl Session {
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
+        let query_start = Instant::now();
+
         // Analyze SQL
+        let parse_start = Instant::now();
         let analysis = match self.analyzer.analyze(sql) {
             Ok(a) => a,
             Err(e) => {
@@ -241,15 +247,18 @@ impl Session {
                 client
                     .send(err.encode(1, self.state.capability_flags))
                     .await?;
+                metrics().record_query_error("parse_error");
                 return Ok(());
             }
         };
+        let parse_elapsed = parse_start.elapsed();
 
         debug!(
             session_id = self.id,
             stmt_type = ?analysis.stmt_type,
             tables = ?analysis.tables,
             shard_keys = ?analysis.shard_keys,
+            parse_time_us = parse_elapsed.as_micros(),
             "SQL analyzed"
         );
 
@@ -286,15 +295,25 @@ impl Session {
         }
 
         // Route the query
+        let route_start = Instant::now();
         let route_result = self.router.route(sql, &analysis, self.state.in_transaction);
+        let route_elapsed = route_start.elapsed();
 
         debug!(
             session_id = self.id,
             shards = ?route_result.shards,
             target = ?route_result.target,
             is_scatter = route_result.is_scatter,
+            route_time_us = route_elapsed.as_micros(),
             "Query routed"
         );
+
+        // Record routing metrics
+        let target_str = match route_result.target {
+            RouteTarget::Master => "master",
+            RouteTarget::Slave => "slave",
+        };
+        metrics().record_route(target_str, route_result.is_scatter);
 
         // If in transaction, handle deferred binding and shard consistency
         if self.state.in_transaction {
@@ -346,7 +365,16 @@ impl Session {
 
         // For scatter queries (multiple shards), we need to execute on all and merge results
         if route_result.is_scatter {
+            let scatter_start = Instant::now();
             self.execute_scatter(client, &route_result).await?;
+            let scatter_elapsed = scatter_start.elapsed();
+            info!(
+                session_id = self.id,
+                shard_count = route_result.shards.len(),
+                query_time_ms = query_start.elapsed().as_millis(),
+                scatter_time_ms = scatter_elapsed.as_millis(),
+                "Scatter query completed"
+            );
         } else {
             // Single shard execution
             let shard_id = &route_result.shards[0];
@@ -385,6 +413,27 @@ impl Session {
             self.execute_with_pooled(client, new_packet, shard_id, route_result.target)
                 .await?;
             // permit is automatically released when dropped
+
+            let query_elapsed = query_start.elapsed();
+            info!(
+                session_id = self.id,
+                shard = %shard_id.0,
+                target = ?route_result.target,
+                query_time_ms = query_elapsed.as_millis(),
+                parse_time_us = parse_elapsed.as_micros(),
+                route_time_us = route_elapsed.as_micros(),
+                "Query completed"
+            );
+
+            // Record query metrics
+            let query_type = match analysis.stmt_type {
+                StatementType::Select => "select",
+                StatementType::Insert => "insert",
+                StatementType::Update => "update",
+                StatementType::Delete => "delete",
+                _ => "other",
+            };
+            metrics().record_query(query_type, &shard_id.0, query_elapsed.as_secs_f64());
         }
 
         Ok(())
@@ -407,22 +456,31 @@ impl Session {
     {
         let key = LimitKey::new(&self.state.username, shard);
 
-        match self.concurrency_controller.acquire(key).await {
-            Ok(permit) => Ok(AcquireResult::Acquired(permit)),
+        match self.concurrency_controller.acquire(key.clone()).await {
+            Ok(permit) => {
+                metrics().record_rate_limit_acquired(&key.user, &key.shard);
+                Ok(AcquireResult::Acquired(permit))
+            }
             Err(LimitError::Disabled) => Ok(AcquireResult::Disabled),
             Err(e) => {
                 // Send error to client but don't disconnect
                 let (code, state, msg) = match &e {
-                    LimitError::QueueFull { max } => (
-                        1040, // ER_CON_COUNT_ERROR
-                        "08004",
-                        format!("Too many connections: queue full (max {})", max),
-                    ),
-                    LimitError::Timeout { timeout } => (
-                        1205, // ER_LOCK_WAIT_TIMEOUT
-                        "HY000",
-                        format!("Rate limit timeout after {:?}", timeout),
-                    ),
+                    LimitError::QueueFull { max } => {
+                        metrics().record_rate_limit_queue_full(&key.user, &key.shard);
+                        (
+                            1040, // ER_CON_COUNT_ERROR
+                            "08004",
+                            format!("Too many connections: queue full (max {})", max),
+                        )
+                    }
+                    LimitError::Timeout { timeout } => {
+                        metrics().record_rate_limit_timeout(&key.user, &key.shard);
+                        (
+                            1205, // ER_LOCK_WAIT_TIMEOUT
+                            "HY000",
+                            format!("Rate limit timeout after {:?}", timeout),
+                        )
+                    }
                     LimitError::Disabled => unreachable!(),
                 };
 
@@ -856,6 +914,15 @@ pub enum SessionError {
 
     #[error("Rate limit error: {0}")]
     RateLimit(#[from] LimitError),
+}
+
+/// Truncate SQL for logging (avoid huge log entries)
+fn truncate_sql(sql: &str, max_len: usize) -> String {
+    if sql.len() <= max_len {
+        sql.to_string()
+    } else {
+        format!("{}...", &sql[..max_len])
+    }
 }
 
 /// Parse length-encoded integer from MySQL packet

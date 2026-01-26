@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "signal"] }
 sqlparser = { version = "0.40", features = ["visitor"] }
 mysql_common = "0.31"
 dashmap = "5"
@@ -19,3 +19,7 @@ sha1 = "0.10"
 rand = "0.8"
 anyhow = "1"
 futures = "0.3"
+prometheus = "0.13"
+hyper = { version = "1.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
