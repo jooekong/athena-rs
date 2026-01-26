@@ -36,6 +36,8 @@ pub struct PooledConnection {
     pub(crate) capabilities: u32,
     /// Current database
     pub(crate) database: Option<String>,
+    /// Backend address (host:port) for pool tracking
+    pub(crate) backend_addr: String,
 }
 
 impl PooledConnection {
@@ -126,6 +128,7 @@ impl PooledConnection {
             last_used_at: now,
             capabilities: caps,
             database: db,
+            backend_addr: addr,
         })
     }
 
@@ -246,6 +249,11 @@ impl PooledConnection {
     /// Get backend capability flags
     pub fn capabilities(&self) -> u32 {
         self.capabilities
+    }
+
+    /// Get backend address (host:port)
+    pub fn backend_addr(&self) -> &str {
+        &self.backend_addr
     }
 
     /// Send a packet to the backend

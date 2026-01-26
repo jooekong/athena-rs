@@ -701,8 +701,9 @@ impl Session {
             }
         }
 
-        // Handle deprecated EOF mode (based on backend capabilities)
-        if !(backend_caps & capabilities::CLIENT_DEPRECATE_EOF != 0) {
+        // In non-DEPRECATE_EOF mode, read rows (second loop for rows + final EOF)
+        // First loop above handled column definitions + first EOF
+        if backend_caps & capabilities::CLIENT_DEPRECATE_EOF == 0 {
             loop {
                 let packet = tx_pool
                     .recv(self.id)
@@ -804,8 +805,9 @@ impl Session {
             }
         }
 
-        // Handle deprecated EOF mode (based on backend capabilities)
-        if !(backend_caps & capabilities::CLIENT_DEPRECATE_EOF != 0) {
+        // In non-DEPRECATE_EOF mode, read rows (second loop for rows + final EOF)
+        // First loop above handled column definitions + first EOF
+        if backend_caps & capabilities::CLIENT_DEPRECATE_EOF == 0 {
             loop {
                 let packet = conn
                     .recv()

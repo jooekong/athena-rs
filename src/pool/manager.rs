@@ -131,16 +131,27 @@ impl PoolManager {
         database: Option<String>,
     ) -> Result<PooledConnection, ConnectionError> {
         let pools = self.stateless_pools.read().await;
-        if let Some(pool) = pools.get(shard_id) {
-            pool.get().await
+        let pool = if let Some(pool) = pools.get(shard_id) {
+            pool.clone()
         } else {
             // Fall back to default if shard not found
             pools
                 .get(&ShardId::default_shard())
                 .ok_or(ConnectionError::Disconnected)?
-                .get()
-                .await
+                .clone()
+        };
+        drop(pools); // Release lock before async operation
+
+        let mut conn = pool.get().await?;
+
+        // Switch database if needed
+        if let Some(ref db) = database {
+            if conn.database.as_ref() != Some(db) {
+                conn.change_database(db).await?;
+            }
         }
+
+        Ok(conn)
     }
 
     /// Get a connection from a slave pool for a shard (round-robin)
@@ -159,9 +170,22 @@ impl PoolManager {
                     .slave_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     % slave_pools.len();
-                return slave_pools[idx].get().await;
+                let pool = slave_pools[idx].clone();
+                drop(slaves); // Release lock before async operation
+
+                let mut conn = pool.get().await?;
+
+                // Switch database if needed
+                if let Some(ref db) = database {
+                    if conn.database.as_ref() != Some(db) {
+                        conn.change_database(db).await?;
+                    }
+                }
+
+                return Ok(conn);
             }
         }
+        drop(slaves); // Release lock before fallback
 
         // Fall back to master
         self.get_master(shard_id, database).await
@@ -178,10 +202,35 @@ impl PoolManager {
     }
 
     /// Return a connection to a slave pool
+    ///
+    /// Finds the correct slave pool by matching the connection's backend address.
     pub async fn put_slave(&self, shard_id: &ShardId, conn: PooledConnection) {
-        // For simplicity, return to master pool
-        // In a real implementation, you'd track which pool the connection came from
-        self.put_master(shard_id, conn).await;
+        let conn_addr = conn.backend_addr().to_string();
+
+        // Find the slave pool that matches this connection's backend address
+        let matching_pool = {
+            let slaves = self.slave_pools.read().await;
+            if let Some(slave_pools) = slaves.get(shard_id) {
+                slave_pools
+                    .iter()
+                    .find(|pool| pool.backend_addr() == conn_addr)
+                    .cloned()
+            } else {
+                None
+            }
+        };
+
+        if let Some(pool) = matching_pool {
+            pool.put(conn).await;
+        } else {
+            // Connection didn't match any slave pool, discard it
+            debug!(
+                shard = %shard_id.0,
+                addr = %conn_addr,
+                "Slave connection didn't match any pool, discarding"
+            );
+            drop(conn);
+        }
     }
 
     /// Get connection based on route target (Master or Slave)

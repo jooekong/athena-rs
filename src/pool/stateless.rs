@@ -152,4 +152,9 @@ impl StatelessPool {
         }
         debug!("Closed all idle connections");
     }
+
+    /// Get backend address (host:port) for this pool
+    pub fn backend_addr(&self) -> String {
+        format!("{}:{}", self.backend_config.host, self.backend_config.port)
+    }
 }
