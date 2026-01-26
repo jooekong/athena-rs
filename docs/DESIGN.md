@@ -50,6 +50,16 @@ Backend MySQL
    - 连接绑定到 Session，直到 COMMIT/ROLLBACK
    - 保证事务内所有操作使用同一连接
 
+**事务语义（延迟开启）：**
+```
+Client: BEGIN     → Proxy: 本地标记 in_transaction=true, 返回 OK（不发后端）
+Client: SELECT... → Proxy: 绑定 shard, 创建连接, 发送 BEGIN, 吞掉 OK, 发送 SELECT
+Client: COMMIT    → Proxy: 发送 COMMIT 到后端, 清理事务状态
+```
+
+- 若事务内无任何查询，COMMIT/ROLLBACK 只返回 OK，不发后端
+- `transaction_started` 标志位追踪 BEGIN 是否已发送到后端
+
 2. **无状态池 (StatelessPool)**
    - 普通读写查询
    - 用完即还，支持连接复用
@@ -70,6 +80,10 @@ Backend MySQL
 - 按 `(user, shard)` 粒度控制并发
 - 超过限制进入等待队列
 - 队列满或超时 → 拒绝请求（返回 MySQL 错误，不断开连接）
+
+**获取流程（双路径）：**
+1. **快速路径**：`try_acquire_owned` 尝试立即获取，成功则返回（不计入等待）
+2. **慢速路径**：快速路径失败后，检查队列是否已满，未满则入队等待
 
 **限流配置：**
 ```toml

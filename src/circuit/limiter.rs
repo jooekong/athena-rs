@@ -179,7 +179,19 @@ impl ConcurrencyController {
             })
             .clone();
 
-        // Check if queue is full
+        // Fast path: try to acquire immediately without waiting
+        let semaphore = limit.semaphore.clone();
+        if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+            self.stats.acquired.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                user = %key.user,
+                shard = %key.shard,
+                "Acquired rate limit permit (fast path)"
+            );
+            return Ok(LimitPermit::new(permit, key));
+        }
+
+        // Slow path: need to wait, check if queue is full first
         let current_waiting = limit.waiting.fetch_add(1, Ordering::SeqCst);
         if current_waiting >= self.config.max_queue_size {
             limit.waiting.fetch_sub(1, Ordering::SeqCst);
@@ -196,7 +208,6 @@ impl ConcurrencyController {
         }
 
         // Try to acquire semaphore with timeout
-        let semaphore = limit.semaphore.clone();
         let result = timeout(
             self.config.queue_timeout,
             semaphore.acquire_owned(),
@@ -212,7 +223,7 @@ impl ConcurrencyController {
                 debug!(
                     user = %key.user,
                     shard = %key.shard,
-                    "Acquired rate limit permit"
+                    "Acquired rate limit permit (slow path)"
                 );
                 Ok(LimitPermit::new(permit, key))
             }
@@ -445,5 +456,66 @@ mod tests {
         let stats = controller.stats();
         assert_eq!(stats.total_acquired, 3);
         assert_eq!(stats.active_keys, 3);
+    }
+
+    #[tokio::test]
+    async fn test_zero_queue_size_first_acquire_succeeds() {
+        // With queue_size=0, the first acquire should still succeed
+        // because it doesn't need to wait (permit is available)
+        let config = LimitConfig {
+            max_concurrent: 1,
+            max_queue_size: 0,
+            queue_timeout: Duration::from_millis(100),
+            enabled: true,
+        };
+        let controller = ConcurrencyController::new(config);
+
+        let key = LimitKey::new("user1", "shard1");
+
+        // First acquire should succeed (permit available, no waiting needed)
+        let permit = controller.acquire(key.clone()).await;
+        assert!(permit.is_ok(), "First acquire should succeed with available permit");
+
+        // Second acquire should fail with QueueFull (no queue allowed)
+        let result = controller.acquire(key).await;
+        assert!(matches!(result, Err(LimitError::QueueFull { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_no_queue_increment() {
+        // When permits are available, we should not increment waiting count
+        let config = LimitConfig {
+            max_concurrent: 2,
+            max_queue_size: 1,
+            queue_timeout: Duration::from_millis(100),
+            enabled: true,
+        };
+        let controller = ConcurrencyController::new(config);
+
+        let key = LimitKey::new("user1", "shard1");
+
+        // Acquire both permits - should not increment waiting count
+        let _permit1 = controller.acquire(key.clone()).await.unwrap();
+        let _permit2 = controller.acquire(key.clone()).await.unwrap();
+
+        // Third acquire should be able to wait (queue_size=1)
+        // This tests that first two acquires didn't consume queue slots
+        let controller_clone = Arc::new(controller);
+        let controller_for_spawn = controller_clone.clone();
+        let key_clone = key.clone();
+        
+        let handle = tokio::spawn(async move {
+            controller_for_spawn.acquire(key_clone).await
+        });
+
+        // Give it time to start waiting
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Fourth acquire should fail with QueueFull (queue is now at capacity)
+        let result = controller_clone.acquire(key).await;
+        assert!(matches!(result, Err(LimitError::QueueFull { .. })));
+
+        // Clean up
+        drop(handle);
     }
 }

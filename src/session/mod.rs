@@ -278,12 +278,12 @@ impl Session {
         if analysis.stmt_type == StatementType::Commit
             || analysis.stmt_type == StatementType::Rollback
         {
-            if self.state.transaction_shard.is_some() {
-                // Transaction was bound to a shard, execute on backend
+            if self.state.transaction_started {
+                // Transaction was actually started on backend, forward COMMIT/ROLLBACK
                 self.execute_with_transaction(client, original_packet.clone())
                     .await?;
             } else {
-                // Transaction was never bound (no queries executed), just send OK
+                // Transaction was never started on backend (no queries executed), just send OK
                 let ok = OkPacket::new();
                 client
                     .send(ok.encode(1, self.state.capability_flags))
@@ -332,13 +332,24 @@ impl Session {
 
             let target_shard = &route_result.shards[0];
 
-            // First query in transaction - bind to shard
+            // First query in transaction - bind to shard and send BEGIN to backend
             if self.state.transaction_shard.is_none() {
                 self.state.bind_transaction_shard(target_shard.0.clone());
                 self.pool_manager
                     .begin_transaction(self.id, target_shard, self.state.database.clone())
                     .await
                     .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
+
+                // Send BEGIN to backend and consume OK
+                if let Err(e) = self.send_begin_to_backend().await {
+                    // Failed to start transaction on backend, clean up
+                    self.state.end_transaction();
+                    self.pool_manager.end_transaction(self.id).await;
+                    let err = ErrPacket::new(1105, "HY000", &format!("Failed to start transaction: {}", e));
+                    client.send(err.encode(1, self.state.capability_flags)).await?;
+                    return Ok(());
+                }
+                self.state.mark_transaction_started();
             } else {
                 // Check shard consistency
                 let bound_shard = self.state.transaction_shard.as_ref().unwrap();
@@ -688,6 +699,48 @@ impl Session {
             }
         }
 
+        Ok(())
+    }
+
+    /// Send BEGIN to backend and consume the OK response
+    ///
+    /// This is called on the first query in a transaction to actually start
+    /// the transaction on the backend MySQL server.
+    async fn send_begin_to_backend(&self) -> Result<(), SessionError> {
+        let tx_pool = self.pool_manager.transaction_pool();
+
+        // Build BEGIN packet
+        let mut payload = vec![0x03]; // COM_QUERY
+        payload.extend_from_slice(b"BEGIN");
+        let begin_packet = Packet {
+            sequence_id: 0,
+            payload: payload.into(),
+        };
+
+        // Send BEGIN to backend
+        tx_pool
+            .send(self.id, begin_packet)
+            .await
+            .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
+
+        // Receive and validate response
+        let response = tx_pool
+            .recv(self.id)
+            .await
+            .map_err(|_| SessionError::BackendDisconnected)?;
+
+        if is_err_packet(&response.payload) {
+            let err = ErrPacket::parse(&response.payload, self.state.capability_flags)
+                .map(|e| e.error_message)
+                .unwrap_or_else(|| "Unknown error".to_string());
+            return Err(SessionError::Protocol(format!("BEGIN failed: {}", err)));
+        }
+
+        if !is_ok_packet(&response.payload) {
+            return Err(SessionError::Protocol("Expected OK packet after BEGIN".into()));
+        }
+
+        debug!(session_id = self.id, "BEGIN sent to backend successfully");
         Ok(())
     }
 

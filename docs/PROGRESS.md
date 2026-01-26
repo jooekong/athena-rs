@@ -281,8 +281,32 @@ done
 
 **待完成（可选优化）：**
 - [ ] 配置热重载
-- [ ] 性能测试与优化
-- [ ] 集成测试（端到端）
+
+---
+
+### Phase 7: Bug Fixes & Testing ✅ 完成
+
+**修复的问题：**
+
+6. **[Critical] 事务语义错误**
+   - 问题：客户端发送 BEGIN 后，代理只在本地标记事务状态，未向后端发送 BEGIN
+   - 修复：首次事务内查询前，向后端发送 BEGIN 并吞掉 OK；添加 `transaction_started` 标志位
+   - 文件：`src/session/mod.rs`, `src/session/state.rs`
+
+7. **[High] 限流队列边界错误**
+   - 问题：`queue_size=0` 时，首个请求也会因 `0 >= 0` 判断被拒绝
+   - 修复：添加快速路径，先尝试 `try_acquire_owned`，成功则直接返回；失败才检查队列是否已满
+   - 文件：`src/circuit/limiter.rs`
+
+**新增测试：**
+- `test_zero_queue_size_first_acquire_succeeds` - 验证 queue_size=0 时首次获取成功
+- `test_fast_path_no_queue_increment` - 验证快速路径不增加等待计数
+
+**集成测试框架：**
+- [x] 创建 `tests/integration/` 目录结构
+- [x] 事务测试用例（placeholder）
+- [x] 限流测试用例（placeholder）
+- [x] 性能测试文档 `docs/PERF.md`
 
 ---
 
@@ -319,17 +343,23 @@ athena-rs/
 │   │   └── manager.rs
 │   ├── circuit/
 │   │   ├── mod.rs
-│   │   └── limiter.rs          # ConcurrencyController
-│   ├── metrics/                 # Phase 6 新增
+│   │   └── limiter.rs          # ConcurrencyController（含快速路径）
+│   ├── metrics/
 │   │   └── mod.rs              # Prometheus 指标 + HTTP 端点
 │   └── session/
-│       ├── mod.rs              # 带 tracing spans
-│       └── state.rs
+│       ├── mod.rs              # 带 tracing spans + 事务 BEGIN 修复
+│       └── state.rs            # 包含 transaction_started 标志
+├── tests/
+│   └── integration/             # 集成测试
+│       ├── main.rs
+│       ├── transaction.rs
+│       └── limiter.rs
 ├── config/
 │   └── athena.toml
 └── docs/
     ├── DESIGN.md
-    └── PROGRESS.md
+    ├── PROGRESS.md
+    └── PERF.md                  # 性能测试指南
 ```
 
 ## 依赖
