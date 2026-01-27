@@ -55,14 +55,16 @@ impl StatementType {
     }
 }
 
+use crate::router::ShardValue;
+
 /// Shard key value extracted from SQL
 #[derive(Debug, Clone)]
 pub enum ShardKeyValue {
-    /// Single value (e.g., user_id = 123)
-    Single(i64),
-    /// Multiple values (e.g., user_id IN (1, 2, 3))
-    Multiple(Vec<i64>),
-    /// Range (e.g., user_id BETWEEN 1 AND 100)
+    /// Single value (e.g., user_id = 123 or user_id = 'abc')
+    Single(ShardValue),
+    /// Multiple values (e.g., user_id IN (1, 2, 3) or user_id IN ('a', 'b'))
+    Multiple(Vec<ShardValue>),
+    /// Range (e.g., user_id BETWEEN 1 AND 100) - integers only
     Range { start: i64, end: i64 },
     /// Unknown/not extractable
     Unknown,
@@ -144,13 +146,13 @@ impl SqlAnalyzer {
 
                         // Collect values from ALL rows, not just first row
                         // This handles multi-row INSERT correctly
-                        let mut col_values: std::collections::HashMap<String, Vec<i64>> =
+                        let mut col_values: std::collections::HashMap<String, Vec<ShardValue>> =
                             std::collections::HashMap::new();
 
                         for row in &values.rows {
                             for (idx, expr) in row.iter().enumerate() {
                                 if idx < cols.len() {
-                                    if let Some(val) = self.extract_literal_value(expr) {
+                                    if let Some(val) = self.extract_shard_value(expr) {
                                         col_values
                                             .entry(cols[idx].clone())
                                             .or_default()
@@ -163,14 +165,16 @@ impl SqlAnalyzer {
                         // Convert collected values to ShardKeyValue
                         for (col, vals) in col_values {
                             let shard_value = if vals.len() == 1 {
-                                ShardKeyValue::Single(vals[0])
+                                ShardKeyValue::Single(vals[0].clone())
                             } else {
-                                // Multiple rows with potentially different values
-                                let mut unique_vals = vals.clone();
-                                unique_vals.sort();
-                                unique_vals.dedup();
+                                // Multiple rows with potentially different values - dedup by hash
+                                let mut seen = std::collections::HashSet::new();
+                                let unique_vals: Vec<ShardValue> = vals
+                                    .into_iter()
+                                    .filter(|v| seen.insert(v.hash_code()))
+                                    .collect();
                                 if unique_vals.len() == 1 {
-                                    ShardKeyValue::Single(unique_vals[0])
+                                    ShardKeyValue::Single(unique_vals[0].clone())
                                 } else {
                                     ShardKeyValue::Multiple(unique_vals)
                                 }
@@ -312,7 +316,7 @@ impl SqlAnalyzer {
             Expr::BinaryOp { left, op, right } => {
                 match op {
                     BinaryOperator::Eq => {
-                        if let Some((col, val)) = self.extract_column_value_pair(left, right) {
+                        if let Some((col, val)) = self.extract_column_shard_value_pair(left, right) {
                             result.push((col, ShardKeyValue::Single(val)));
                         }
                     }
@@ -326,30 +330,30 @@ impl SqlAnalyzer {
             }
             // Handle: column IN (v1, v2, v3)
             Expr::InList { expr, list, negated } if !negated => {
-                if let Expr::Identifier(ident) = expr.as_ref() {
-                    let values: Vec<i64> = list
+                if let Some(col_name) = self.extract_column_name(expr) {
+                    let values: Vec<ShardValue> = list
                         .iter()
-                        .filter_map(|e| self.extract_literal_value(e))
+                        .filter_map(|e| self.extract_shard_value(e))
                         .collect();
                     if !values.is_empty() {
-                        result.push((ident.value.clone(), ShardKeyValue::Multiple(values)));
+                        result.push((col_name, ShardKeyValue::Multiple(values)));
                     }
                 }
             }
-            // Handle: column BETWEEN start AND end
+            // Handle: column BETWEEN start AND end (integers only)
             Expr::Between {
                 expr,
                 low,
                 high,
                 negated,
             } if !negated => {
-                if let Expr::Identifier(ident) = expr.as_ref() {
+                if let Some(col_name) = self.extract_column_name(expr) {
                     if let (Some(start), Some(end)) = (
-                        self.extract_literal_value(low),
-                        self.extract_literal_value(high),
+                        self.extract_integer_value(low),
+                        self.extract_integer_value(high),
                     ) {
                         result.push((
-                            ident.value.clone(),
+                            col_name,
                             ShardKeyValue::Range { start, end },
                         ));
                     }
@@ -363,23 +367,59 @@ impl SqlAnalyzer {
         }
     }
 
-    fn extract_column_value_pair(&self, left: &Expr, right: &Expr) -> Option<(String, i64)> {
+    fn extract_column_shard_value_pair(&self, left: &Expr, right: &Expr) -> Option<(String, ShardValue)> {
         // Try column = value
-        if let Expr::Identifier(ident) = left {
-            if let Some(val) = self.extract_literal_value(right) {
-                return Some((ident.value.clone(), val));
+        if let Some(col_name) = self.extract_column_name(left) {
+            if let Some(val) = self.extract_shard_value(right) {
+                return Some((col_name, val));
             }
         }
         // Try value = column
-        if let Expr::Identifier(ident) = right {
-            if let Some(val) = self.extract_literal_value(left) {
-                return Some((ident.value.clone(), val));
+        if let Some(col_name) = self.extract_column_name(right) {
+            if let Some(val) = self.extract_shard_value(left) {
+                return Some((col_name, val));
             }
         }
         None
     }
 
-    fn extract_literal_value(&self, expr: &Expr) -> Option<i64> {
+    /// Extract column name from identifier or compound identifier (e.g., u.user_id -> user_id)
+    fn extract_column_name(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            Expr::CompoundIdentifier(parts) => {
+                // For compound identifiers like "u.user_id", take the last part (column name)
+                parts.last().map(|p| p.value.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract a ShardValue (integer or string) from an expression
+    fn extract_shard_value(&self, expr: &Expr) -> Option<ShardValue> {
+        match expr {
+            Expr::Value(Value::Number(n, _)) => {
+                n.parse::<i64>().ok().map(ShardValue::Integer)
+            }
+            Expr::Value(Value::SingleQuotedString(s)) => {
+                Some(ShardValue::String(s.clone()))
+            }
+            Expr::Value(Value::DoubleQuotedString(s)) => {
+                Some(ShardValue::String(s.clone()))
+            }
+            Expr::UnaryOp { op: sqlparser::ast::UnaryOperator::Minus, expr } => {
+                if let Expr::Value(Value::Number(n, _)) = expr.as_ref() {
+                    n.parse::<i64>().ok().map(|v| ShardValue::Integer(-v))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract an integer value from an expression (for BETWEEN)
+    fn extract_integer_value(&self, expr: &Expr) -> Option<i64> {
         match expr {
             Expr::Value(Value::Number(n, _)) => n.parse().ok(),
             Expr::UnaryOp { op: sqlparser::ast::UnaryOperator::Minus, expr } => {
@@ -426,6 +466,77 @@ mod tests {
         assert!(result.is_read_only);
         assert_eq!(result.shard_keys.len(), 1);
         assert_eq!(result.shard_keys[0].0, "user_id");
+    }
+
+    #[test]
+    fn test_select_with_string_shard_key() {
+        let analyzer = SqlAnalyzer::new();
+
+        let sql = "SELECT * FROM users WHERE tenant_id = 'acme_corp'";
+        let result = analyzer.analyze(sql).unwrap();
+
+        assert_eq!(result.stmt_type, StatementType::Select);
+        assert_eq!(result.shard_keys.len(), 1);
+        assert_eq!(result.shard_keys[0].0, "tenant_id");
+        match &result.shard_keys[0].1 {
+            ShardKeyValue::Single(ShardValue::String(s)) => {
+                assert_eq!(s, "acme_corp");
+            }
+            _ => panic!("Expected Single(String)"),
+        }
+    }
+
+    #[test]
+    fn test_select_with_string_in_list() {
+        let analyzer = SqlAnalyzer::new();
+
+        let sql = "SELECT * FROM users WHERE tenant_id IN ('acme', 'beta', 'gamma')";
+        let result = analyzer.analyze(sql).unwrap();
+
+        assert_eq!(result.shard_keys.len(), 1);
+        match &result.shard_keys[0].1 {
+            ShardKeyValue::Multiple(values) => {
+                assert_eq!(values.len(), 3);
+                assert!(values.iter().all(|v| matches!(v, ShardValue::String(_))));
+            }
+            _ => panic!("Expected Multiple"),
+        }
+    }
+
+    #[test]
+    fn test_insert_with_string_shard_key() {
+        let analyzer = SqlAnalyzer::new();
+
+        let sql = "INSERT INTO orders (tenant_id, order_id) VALUES ('acme_corp', 123)";
+        let result = analyzer.analyze(sql).unwrap();
+
+        assert_eq!(result.stmt_type, StatementType::Insert);
+        // Should extract both columns
+        let tenant_key = result.shard_keys.iter().find(|(col, _)| col == "tenant_id");
+        assert!(tenant_key.is_some());
+        match &tenant_key.unwrap().1 {
+            ShardKeyValue::Single(ShardValue::String(s)) => {
+                assert_eq!(s, "acme_corp");
+            }
+            _ => panic!("Expected Single(String)"),
+        }
+    }
+
+    #[test]
+    fn test_insert_multi_row_string_keys() {
+        let analyzer = SqlAnalyzer::new();
+
+        let sql = "INSERT INTO orders (tenant_id, name) VALUES ('acme', 'Order1'), ('beta', 'Order2')";
+        let result = analyzer.analyze(sql).unwrap();
+
+        let tenant_key = result.shard_keys.iter().find(|(col, _)| col == "tenant_id");
+        assert!(tenant_key.is_some());
+        match &tenant_key.unwrap().1 {
+            ShardKeyValue::Multiple(values) => {
+                assert_eq!(values.len(), 2);
+            }
+            _ => panic!("Expected Multiple for multi-row insert"),
+        }
     }
 
     #[test]

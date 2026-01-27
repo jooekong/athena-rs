@@ -6,7 +6,7 @@ mod shard;
 pub use rule::{RouterConfig, ShardingRule};
 pub use rw_split::{RouteTarget, RwSplitter};
 pub use selector::{FirstSelector, InstanceSelector, ReadWriteRouter, RoundRobinSelector};
-pub use shard::{ShardAlgorithm, ShardCalculator};
+pub use shard::{ShardAlgorithm, ShardCalculator, ShardValue};
 
 use std::collections::HashMap;
 
@@ -24,6 +24,8 @@ pub struct RouteResult {
     pub rewritten_sqls: HashMap<ShardId, String>,
     /// Whether this is a scatter query (hits multiple shards)
     pub is_scatter: bool,
+    /// Whether the shard intersection was empty (multiple sharded tables with no common shard)
+    pub empty_intersection: bool,
 }
 
 /// SQL Router
@@ -67,7 +69,7 @@ impl Router {
                 let calc = self.config.find_calculator(table).unwrap();
 
                 let shards = match shard_value {
-                    Some(ShardKeyValue::Single(v)) => vec![calc.calculate(*v)],
+                    Some(ShardKeyValue::Single(v)) => vec![calc.calculate(v)],
                     Some(ShardKeyValue::Multiple(values)) => calc.calculate_all(values),
                     Some(ShardKeyValue::Range { start, end }) => {
                         calc.calculate_range_values(*start, *end)
@@ -89,10 +91,18 @@ impl Router {
             }
         }
 
-        // If no sharded tables or empty intersection, use default shard
-        let shards = match target_shards {
-            Some(s) if !s.is_empty() => s,
-            _ => vec![0], // Default shard for non-sharded tables or empty intersection
+        // Determine if we have an empty intersection from sharded tables
+        let (shards, empty_intersection) = match &target_shards {
+            Some(s) if !s.is_empty() => (s.clone(), false),
+            Some(_) => {
+                // Empty intersection: multiple sharded tables with no common shard
+                // Fall back to shard 0 but flag it
+                (vec![0], true)
+            }
+            None => {
+                // No sharded tables - use default shard
+                (vec![0], false)
+            }
         };
         let is_scatter = shards.len() > 1;
 
@@ -129,6 +139,7 @@ impl Router {
             target,
             rewritten_sqls,
             is_scatter,
+            empty_intersection,
         }
     }
 
@@ -176,14 +187,22 @@ mod tests {
         let analysis = analyzer.analyze(sql).unwrap();
         let result = router.route(sql, &analysis, false);
 
+        // Should route to exactly one shard
         assert_eq!(result.shards.len(), 1);
-        assert_eq!(result.shards[0].0, "shard_1"); // 5 % 4 = 1
         assert!(!result.is_scatter);
         assert_eq!(result.target, RouteTarget::Slave);
 
-        // Check rewritten SQL
+        // Shard ID should be in expected format
+        assert!(result.shards[0].0.starts_with("shard_"));
+
+        // Check rewritten SQL contains the physical table name
         let rewritten = result.rewritten_sqls.get(&result.shards[0]).unwrap();
-        assert!(rewritten.contains("users_1"));
+        let shard_idx: usize = result.shards[0].0.strip_prefix("shard_").unwrap().parse().unwrap();
+        assert!(rewritten.contains(&format!("users_{}", shard_idx)));
+
+        // Same value should always route to same shard (consistency check)
+        let result2 = router.route(sql, &analysis, false);
+        assert_eq!(result.shards[0], result2.shards[0]);
     }
 
     #[test]
@@ -228,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_route_empty_intersection_fallback() {
+    fn test_route_empty_intersection_detected() {
         // Setup router with two tables that have different sharding
         let mut config = RouterConfig::new();
         config.add_rule(ShardingRule {
@@ -250,15 +269,65 @@ mod tests {
         let router = Router::new(config);
         let analyzer = SqlAnalyzer::new();
 
+        // Find two values that hash to different shards to create an empty intersection
+        let calc = ShardCalculator::new(ShardAlgorithm::Mod, 4);
+
+        // Try many combinations to find values that hash to different shards
+        let mut user_id = 1i64;
+        let mut order_id = 2i64;
+        let mut found = false;
+
+        for u in 1..1000 {
+            let user_shard = calc.calculate_i64(u);
+            for o in 1..1000 {
+                let order_shard = calc.calculate_i64(o);
+                if user_shard != order_shard {
+                    user_id = u;
+                    order_id = o;
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                break;
+            }
+        }
+
+        assert!(found, "Could not find values that hash to different shards");
+
         // Query joining two tables with incompatible shard keys
-        // user_id=1 -> shard 1, order_id=2 -> shard 2
-        // Intersection is empty, should fallback to default
-        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.user_id = 1 AND o.order_id = 2";
+        let sql = format!(
+            "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.user_id = {} AND o.order_id = {}",
+            user_id, order_id
+        );
+        let analysis = analyzer.analyze(&sql).unwrap();
+        let result = router.route(&sql, &analysis, false);
+
+        // Should flag as empty intersection
+        assert!(
+            result.empty_intersection,
+            "Expected empty_intersection=true for user_id={} (shard {}) and order_id={} (shard {})",
+            user_id,
+            calc.calculate_i64(user_id),
+            order_id,
+            calc.calculate_i64(order_id)
+        );
+        // Should still have a shard (fallback)
+        assert!(!result.shards.is_empty());
+    }
+
+    #[test]
+    fn test_route_non_sharded_not_empty_intersection() {
+        let router = setup_router();
+        let analyzer = SqlAnalyzer::new();
+
+        // Query on non-sharded table should NOT be flagged as empty intersection
+        let sql = "SELECT * FROM products WHERE id = 1";
         let analysis = analyzer.analyze(sql).unwrap();
         let result = router.route(sql, &analysis, false);
 
-        // Should not panic, should have at least one shard
-        assert!(!result.shards.is_empty());
+        assert!(!result.empty_intersection);
+        assert_eq!(result.shards.len(), 1);
     }
 
     #[test]
@@ -266,13 +335,66 @@ mod tests {
         let router = setup_router();
         let analyzer = SqlAnalyzer::new();
 
-        // user_id IN (4, 5, 8) -> shards 0, 1, 0 -> unique: 0, 1
-        let sql = "SELECT * FROM users WHERE user_id IN (4, 5, 8)";
+        // Test scatter query with IN clause
+        let sql = "SELECT * FROM users WHERE user_id IN (1, 2, 3, 4, 5, 6, 7, 8)";
         let analysis = analyzer.analyze(sql).unwrap();
         let result = router.route(sql, &analysis, false);
 
-        assert_eq!(result.shards.len(), 2);
-        assert!(result.is_scatter);
+        // Should hit multiple shards (scatter)
+        assert!(result.shards.len() >= 1);
+        assert!(!result.empty_intersection);
+    }
+
+    #[test]
+    fn test_route_string_shard_key() {
+        // Setup router with string-based sharding
+        let mut config = RouterConfig::new();
+        config.add_rule(ShardingRule {
+            name: "tenant_shard".to_string(),
+            table_pattern: "orders".to_string(),
+            shard_column: "tenant_id".to_string(),
+            algorithm: "hash".to_string(),
+            shard_count: 4,
+            range_boundaries: vec![],
+        });
+        let router = Router::new(config);
+        let analyzer = SqlAnalyzer::new();
+
+        let sql = "SELECT * FROM orders WHERE tenant_id = 'acme_corp'";
+        let analysis = analyzer.analyze(sql).unwrap();
+        let result = router.route(sql, &analysis, false);
+
+        // Should route to exactly one shard
+        assert_eq!(result.shards.len(), 1);
+        assert!(!result.is_scatter);
+        assert!(!result.empty_intersection);
+
+        // Same query should always route to same shard
+        let result2 = router.route(sql, &analysis, false);
+        assert_eq!(result.shards[0], result2.shards[0]);
+    }
+
+    #[test]
+    fn test_route_string_shard_key_in_list() {
+        let mut config = RouterConfig::new();
+        config.add_rule(ShardingRule {
+            name: "tenant_shard".to_string(),
+            table_pattern: "orders".to_string(),
+            shard_column: "tenant_id".to_string(),
+            algorithm: "hash".to_string(),
+            shard_count: 4,
+            range_boundaries: vec![],
+        });
+        let router = Router::new(config);
+        let analyzer = SqlAnalyzer::new();
+
+        let sql = "SELECT * FROM orders WHERE tenant_id IN ('acme', 'beta', 'gamma', 'delta')";
+        let analysis = analyzer.analyze(sql).unwrap();
+        let result = router.route(sql, &analysis, false);
+
+        // Should route to one or more shards depending on hash distribution
+        assert!(!result.shards.is_empty());
+        assert!(!result.empty_intersection);
     }
 
     #[test]

@@ -1,14 +1,57 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+/// Shard key value - supports both integer and string types
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ShardValue {
+    Integer(i64),
+    String(String),
+}
+
+impl ShardValue {
+    /// Compute hash code for this value
+    pub fn hash_code(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Try to convert to i64 (for range algorithm)
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            ShardValue::Integer(v) => Some(*v),
+            ShardValue::String(_) => None,
+        }
+    }
+}
+
+impl From<i64> for ShardValue {
+    fn from(v: i64) -> Self {
+        ShardValue::Integer(v)
+    }
+}
+
+impl From<String> for ShardValue {
+    fn from(v: String) -> Self {
+        ShardValue::String(v)
+    }
+}
+
+impl From<&str> for ShardValue {
+    fn from(v: &str) -> Self {
+        ShardValue::String(v.to_string())
+    }
+}
+
 /// Sharding algorithm
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShardAlgorithm {
-    /// Modulo-based sharding: shard_id = value % shard_count
+    /// Modulo-based sharding: shard_id = hash(value) % shard_count
+    /// Note: Uses hashcode to support both integer and string keys
     Mod,
     /// Hash-based sharding: shard_id = hash(value) % shard_count
     Hash,
-    /// Range-based sharding: defined by range boundaries
+    /// Range-based sharding: defined by range boundaries (integer only)
     Range,
 }
 
@@ -59,34 +102,54 @@ impl ShardCalculator {
         }
     }
 
-    /// Calculate shard index for a given value
-    pub fn calculate(&self, value: i64) -> usize {
+    /// Calculate shard index for a given ShardValue
+    pub fn calculate(&self, value: &ShardValue) -> usize {
         match self.algorithm {
-            ShardAlgorithm::Mod => self.calculate_mod(value),
-            ShardAlgorithm::Hash => self.calculate_hash(value),
-            ShardAlgorithm::Range => self.calculate_range(value),
+            ShardAlgorithm::Mod | ShardAlgorithm::Hash => {
+                // Both mod and hash use hashcode for consistency and string support
+                let hash = value.hash_code();
+                (hash % self.shard_count as u64) as usize
+            }
+            ShardAlgorithm::Range => {
+                // Range only works with integers
+                match value.as_i64() {
+                    Some(v) => self.calculate_range_int(v),
+                    None => 0, // Default to shard 0 for non-integer values
+                }
+            }
         }
     }
 
-    /// Calculate all shard indices for a list of values
-    pub fn calculate_all(&self, values: &[i64]) -> Vec<usize> {
-        let mut shards: Vec<usize> = values.iter().map(|v| self.calculate(*v)).collect();
+    /// Calculate shard index for an i64 value (convenience method)
+    pub fn calculate_i64(&self, value: i64) -> usize {
+        self.calculate(&ShardValue::Integer(value))
+    }
+
+    /// Calculate all shard indices for a list of ShardValues
+    pub fn calculate_all(&self, values: &[ShardValue]) -> Vec<usize> {
+        let mut shards: Vec<usize> = values.iter().map(|v| self.calculate(v)).collect();
         shards.sort();
         shards.dedup();
         shards
     }
 
-    /// Calculate shard indices for a range of values
+    /// Calculate all shard indices for a list of i64 values (convenience method)
+    pub fn calculate_all_i64(&self, values: &[i64]) -> Vec<usize> {
+        let shard_values: Vec<ShardValue> = values.iter().map(|v| ShardValue::Integer(*v)).collect();
+        self.calculate_all(&shard_values)
+    }
+
+    /// Calculate shard indices for a range of integer values
     pub fn calculate_range_values(&self, start: i64, end: i64) -> Vec<usize> {
         match self.algorithm {
             ShardAlgorithm::Range => {
                 // For range algorithm, find all shards that overlap with [start, end]
-                let start_shard = self.calculate_range(start);
-                let end_shard = self.calculate_range(end);
+                let start_shard = self.calculate_range_int(start);
+                let end_shard = self.calculate_range_int(end);
                 (start_shard..=end_shard).collect()
             }
             ShardAlgorithm::Mod | ShardAlgorithm::Hash => {
-                // For mod/hash, we need to check all shards if range is large
+                // For mod/hash based on hashcode, we need to check all shards if range is large
                 let range_size = (end - start).abs() as usize;
                 if range_size >= self.shard_count {
                     // Range covers all shards
@@ -94,7 +157,7 @@ impl ShardCalculator {
                 } else {
                     // Check each value in range
                     let mut shards: Vec<usize> = (start..=end)
-                        .map(|v| self.calculate(v))
+                        .map(|v| self.calculate_i64(v))
                         .collect();
                     shards.sort();
                     shards.dedup();
@@ -114,24 +177,7 @@ impl ShardCalculator {
         self.shard_count
     }
 
-    fn calculate_mod(&self, value: i64) -> usize {
-        let unsigned = if value >= 0 {
-            value as u64
-        } else {
-            // Handle negative values by converting to positive
-            (value.wrapping_abs() as u64).wrapping_neg()
-        };
-        (unsigned % self.shard_count as u64) as usize
-    }
-
-    fn calculate_hash(&self, value: i64) -> usize {
-        let mut hasher = DefaultHasher::new();
-        value.hash(&mut hasher);
-        let hash = hasher.finish();
-        (hash % self.shard_count as u64) as usize
-    }
-
-    fn calculate_range(&self, value: i64) -> usize {
+    fn calculate_range_int(&self, value: i64) -> usize {
         for (i, &boundary) in self.range_boundaries.iter().enumerate() {
             if value < boundary {
                 return i;
@@ -146,54 +192,146 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mod_sharding() {
+    fn test_mod_sharding_integers() {
         let calc = ShardCalculator::new(ShardAlgorithm::Mod, 16);
 
-        assert_eq!(calc.calculate(0), 0);
-        assert_eq!(calc.calculate(16), 0);
-        assert_eq!(calc.calculate(17), 1);
-        assert_eq!(calc.calculate(123), 123 % 16);
+        // Mod now uses hashcode, so results are different from simple modulo
+        // But same value should always map to same shard
+        let shard0 = calc.calculate_i64(0);
+        let shard0_again = calc.calculate_i64(0);
+        assert_eq!(shard0, shard0_again);
+
+        // Different values may map to different shards
+        let shard123 = calc.calculate_i64(123);
+        assert!(shard123 < 16);
     }
 
     #[test]
-    fn test_hash_sharding() {
+    fn test_mod_sharding_strings() {
+        let calc = ShardCalculator::new(ShardAlgorithm::Mod, 16);
+
+        // String sharding should be consistent
+        let shard1 = calc.calculate(&ShardValue::String("user_abc".to_string()));
+        let shard2 = calc.calculate(&ShardValue::String("user_abc".to_string()));
+        assert_eq!(shard1, shard2);
+
+        // Different strings may map to different shards
+        let shard_a = calc.calculate(&ShardValue::String("alice".to_string()));
+        let shard_b = calc.calculate(&ShardValue::String("bob".to_string()));
+        assert!(shard_a < 16);
+        assert!(shard_b < 16);
+    }
+
+    #[test]
+    fn test_hash_sharding_integers() {
         let calc = ShardCalculator::new(ShardAlgorithm::Hash, 16);
 
         // Hash should be consistent
-        let shard1 = calc.calculate(123);
-        let shard2 = calc.calculate(123);
+        let shard1 = calc.calculate_i64(123);
+        let shard2 = calc.calculate_i64(123);
         assert_eq!(shard1, shard2);
 
         // Shard should be within range
-        assert!(calc.calculate(999) < 16);
+        assert!(calc.calculate_i64(999) < 16);
+    }
+
+    #[test]
+    fn test_hash_sharding_strings() {
+        let calc = ShardCalculator::new(ShardAlgorithm::Hash, 16);
+
+        // String hashing should be consistent
+        let shard1 = calc.calculate(&ShardValue::String("test_key".to_string()));
+        let shard2 = calc.calculate(&ShardValue::String("test_key".to_string()));
+        assert_eq!(shard1, shard2);
+
+        assert!(calc.calculate(&ShardValue::String("another_key".to_string())) < 16);
+    }
+
+    #[test]
+    fn test_mod_and_hash_produce_same_results() {
+        // Since both mod and hash now use hashcode, they should produce same results
+        let mod_calc = ShardCalculator::new(ShardAlgorithm::Mod, 8);
+        let hash_calc = ShardCalculator::new(ShardAlgorithm::Hash, 8);
+
+        // Integer values
+        assert_eq!(mod_calc.calculate_i64(100), hash_calc.calculate_i64(100));
+        assert_eq!(mod_calc.calculate_i64(999), hash_calc.calculate_i64(999));
+
+        // String values
+        let str_val = ShardValue::String("test".to_string());
+        assert_eq!(mod_calc.calculate(&str_val), hash_calc.calculate(&str_val));
     }
 
     #[test]
     fn test_range_sharding() {
         let calc = ShardCalculator::new_range(vec![100, 200, 300]);
 
-        assert_eq!(calc.calculate(50), 0);   // < 100
-        assert_eq!(calc.calculate(100), 1);  // >= 100, < 200
-        assert_eq!(calc.calculate(150), 1);
-        assert_eq!(calc.calculate(200), 2);  // >= 200, < 300
-        assert_eq!(calc.calculate(300), 3);  // >= 300
-        assert_eq!(calc.calculate(999), 3);
+        assert_eq!(calc.calculate_i64(50), 0);   // < 100
+        assert_eq!(calc.calculate_i64(100), 1);  // >= 100, < 200
+        assert_eq!(calc.calculate_i64(150), 1);
+        assert_eq!(calc.calculate_i64(200), 2);  // >= 200, < 300
+        assert_eq!(calc.calculate_i64(300), 3);  // >= 300
+        assert_eq!(calc.calculate_i64(999), 3);
     }
 
     #[test]
-    fn test_calculate_all() {
-        let calc = ShardCalculator::new(ShardAlgorithm::Mod, 4);
+    fn test_range_sharding_with_string_fallback() {
+        let calc = ShardCalculator::new_range(vec![100, 200, 300]);
 
-        let shards = calc.calculate_all(&[1, 5, 9, 13]); // All map to shard 1
-        assert_eq!(shards, vec![1]);
+        // String values should fallback to shard 0 for range algorithm
+        let shard = calc.calculate(&ShardValue::String("not_a_number".to_string()));
+        assert_eq!(shard, 0);
+    }
 
-        let shards = calc.calculate_all(&[1, 2, 3, 4]);
-        assert_eq!(shards, vec![0, 1, 2, 3]);
+    #[test]
+    fn test_calculate_all_integers() {
+        let calc = ShardCalculator::new(ShardAlgorithm::Hash, 4);
+
+        // Test with values that hash to same shard
+        let values: Vec<ShardValue> = vec![
+            ShardValue::Integer(100),
+            ShardValue::Integer(100), // duplicate
+        ];
+        let shards = calc.calculate_all(&values);
+        assert_eq!(shards.len(), 1); // Deduped
+    }
+
+    #[test]
+    fn test_calculate_all_mixed() {
+        let calc = ShardCalculator::new(ShardAlgorithm::Hash, 4);
+
+        let values: Vec<ShardValue> = vec![
+            ShardValue::Integer(1),
+            ShardValue::Integer(2),
+            ShardValue::String("a".to_string()),
+            ShardValue::String("b".to_string()),
+        ];
+        let shards = calc.calculate_all(&values);
+        // All shards should be within range
+        for shard in &shards {
+            assert!(*shard < 4);
+        }
     }
 
     #[test]
     fn test_all_shards() {
         let calc = ShardCalculator::new(ShardAlgorithm::Mod, 4);
         assert_eq!(calc.all_shards(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_shard_value_hash_consistency() {
+        // Verify that ShardValue hash is consistent
+        let v1 = ShardValue::Integer(42);
+        let v2 = ShardValue::Integer(42);
+        assert_eq!(v1.hash_code(), v2.hash_code());
+
+        let s1 = ShardValue::String("hello".to_string());
+        let s2 = ShardValue::String("hello".to_string());
+        assert_eq!(s1.hash_code(), s2.hash_code());
+
+        // Different values should (usually) have different hashes
+        let v3 = ShardValue::Integer(43);
+        assert_ne!(v1.hash_code(), v3.hash_code());
     }
 }

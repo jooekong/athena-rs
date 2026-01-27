@@ -510,6 +510,19 @@ impl Session {
         };
         metrics().record_route(target_str, route_result.is_scatter);
 
+        // Reject queries with empty shard intersection (conflicting shard keys in multi-table query)
+        if route_result.empty_intersection {
+            let err = ErrPacket::new(
+                1105, // ER_UNKNOWN_ERROR
+                "HY000",
+                "Empty shard intersection: query involves multiple sharded tables with no common shard",
+            );
+            client
+                .send(err.encode(1, self.state.capability_flags))
+                .await?;
+            return Ok(());
+        }
+
         // If in transaction, handle deferred binding and shard consistency
         if self.state.in_transaction {
             // Scatter queries not allowed in transaction
@@ -561,6 +574,19 @@ impl Session {
 
         // For scatter queries (multiple shards), we need to execute on all and merge results
         if route_result.is_scatter {
+            // Reject scatter writes - only SELECT is allowed for scatter queries
+            if analysis.stmt_type.is_write() {
+                let err = ErrPacket::new(
+                    1105, // ER_UNKNOWN_ERROR
+                    "HY000",
+                    "Scatter writes not allowed: INSERT/UPDATE/DELETE must target a single shard",
+                );
+                client
+                    .send(err.encode(1, self.state.capability_flags))
+                    .await?;
+                return Ok(());
+            }
+
             let scatter_start = Instant::now();
             self.execute_scatter(client, &route_result).await?;
             let scatter_elapsed = scatter_start.elapsed();
