@@ -242,6 +242,18 @@ pub struct BackendConfig {
     pub database: Option<String>,
 }
 
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            user: "root".to_string(),
+            password: String::new(),
+            database: None,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -278,6 +290,17 @@ impl DBInstanceConfig {
     /// Check if this instance is a slave
     pub fn is_slave(&self) -> bool {
         self.role == DBInstanceRole::Slave
+    }
+
+    /// Convert to BackendConfig for pool manager
+    pub fn to_backend_config(&self) -> BackendConfig {
+        BackendConfig {
+            host: self.host.clone(),
+            port: self.port,
+            user: self.user.clone(),
+            password: self.password.clone(),
+            database: self.database.clone(),
+        }
     }
 }
 

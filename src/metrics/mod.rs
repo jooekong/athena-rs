@@ -60,6 +60,12 @@ pub struct Metrics {
     pub queries_routed_total: IntCounterVec,
     /// Scatter queries (multi-shard)
     pub scatter_queries_total: IntCounter,
+
+    // Health check metrics
+    /// Health check results by status
+    pub health_check_total: IntCounterVec,
+    /// Current instance health status counts
+    pub health_instances: IntGaugeVec,
 }
 
 impl Metrics {
@@ -193,6 +199,25 @@ impl Metrics {
         )
         .unwrap();
 
+        // Health check metrics
+        let health_check_total = IntCounterVec::new(
+            Opts::new(
+                "athena_health_check_total",
+                "Total number of health checks by result",
+            ),
+            &["result"], // success, failure, timeout
+        )
+        .unwrap();
+
+        let health_instances = IntGaugeVec::new(
+            Opts::new(
+                "athena_health_instances",
+                "Current number of instances by health status",
+            ),
+            &["status"], // healthy, unhealthy, unknown
+        )
+        .unwrap();
+
         // Register all metrics
         registry
             .register(Box::new(connections_total.clone()))
@@ -239,6 +264,12 @@ impl Metrics {
         registry
             .register(Box::new(scatter_queries_total.clone()))
             .unwrap();
+        registry
+            .register(Box::new(health_check_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(health_instances.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -257,6 +288,8 @@ impl Metrics {
             rate_limit_rejected_timeout,
             queries_routed_total,
             scatter_queries_total,
+            health_check_total,
+            health_instances,
         }
     }
 
@@ -314,6 +347,24 @@ impl Metrics {
         self.rate_limit_rejected_timeout
             .with_label_values(&[user, shard])
             .inc();
+    }
+
+    /// Record a health check result
+    pub fn record_health_check(&self, result: &str) {
+        self.health_check_total.with_label_values(&[result]).inc();
+    }
+
+    /// Update health instance counts
+    pub fn set_health_instances(&self, healthy: i64, unhealthy: i64, unknown: i64) {
+        self.health_instances
+            .with_label_values(&["healthy"])
+            .set(healthy);
+        self.health_instances
+            .with_label_values(&["unhealthy"])
+            .set(unhealthy);
+        self.health_instances
+            .with_label_values(&["unknown"])
+            .set(unknown);
     }
 
     /// Get metrics as Prometheus text format

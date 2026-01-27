@@ -3,6 +3,7 @@ mod state;
 pub use state::SessionState;
 
 use crate::circuit::{ConcurrencyController, LimitError, LimitKey, LimitPermit};
+use crate::group::{GroupContext, GroupManager};
 use crate::metrics::metrics;
 use crate::parser::{SqlAnalyzer, StatementType};
 use crate::pool::{ConnectionError, PoolManager, PooledConnection, ShardId};
@@ -36,14 +37,16 @@ pub struct Session {
     pub id: u32,
     /// Session state
     pub state: SessionState,
-    /// Pool manager for backend connections
+    /// Pool manager for backend connections (set after handshake in groups mode)
     pool_manager: Arc<PoolManager>,
+    /// SQL router (set after handshake in groups mode)
+    router: Router,
+    /// Group manager (for groups mode, used to select group on handshake)
+    group_manager: Option<Arc<GroupManager>>,
     /// Concurrency controller for rate limiting
     concurrency_controller: Arc<ConcurrencyController>,
     /// SQL analyzer
     analyzer: SqlAnalyzer,
-    /// SQL router
-    router: Router,
 }
 
 impl Session {
@@ -56,9 +59,10 @@ impl Session {
             id,
             state: SessionState::new(),
             pool_manager,
+            router: Router::default(),
+            group_manager: None,
             concurrency_controller,
             analyzer: SqlAnalyzer::new(),
-            router: Router::default(),
         }
     }
 
@@ -73,10 +77,65 @@ impl Session {
             id,
             state: SessionState::new(),
             pool_manager,
+            router: Router::new(router_config),
+            group_manager: None,
             concurrency_controller,
             analyzer: SqlAnalyzer::new(),
-            router: Router::new(router_config),
         }
+    }
+
+    /// Create session with group manager (groups-only mode)
+    ///
+    /// Pool manager and router will be set after handshake based on username.
+    pub fn with_group_manager(
+        id: u32,
+        group_manager: Arc<GroupManager>,
+        concurrency_controller: Arc<ConcurrencyController>,
+    ) -> Self {
+        // Use default group or create placeholder pool manager
+        let (pool_manager, router) = if let Some(default) = group_manager.default_group() {
+            (
+                default.pool_manager.clone(),
+                Router::new(default.router_config.clone()),
+            )
+        } else {
+            // Placeholder - will be replaced after handshake
+            (
+                Arc::new(PoolManager::new(
+                    crate::config::BackendConfig::default(),
+                    crate::pool::StatelessPoolConfig::default(),
+                )),
+                Router::default(),
+            )
+        };
+
+        Self {
+            id,
+            state: SessionState::new(),
+            pool_manager,
+            router,
+            group_manager: Some(group_manager),
+            concurrency_controller,
+            analyzer: SqlAnalyzer::new(),
+        }
+    }
+
+    /// Select group and update pool manager/router based on username
+    fn select_group(&mut self, username: &str) -> Result<(), SessionError> {
+        if let Some(ref gm) = self.group_manager {
+            let ctx = gm.get_for_user(username).ok_or_else(|| {
+                SessionError::Protocol(format!("No group found for user '{}'", username))
+            })?;
+            info!(
+                session_id = self.id,
+                username = %username,
+                group = %ctx.name,
+                "Selected group for user"
+            );
+            self.pool_manager = ctx.pool_manager.clone();
+            self.router = Router::new(ctx.router_config.clone());
+        }
+        Ok(())
     }
 
     /// Run the session - handle client connection
@@ -113,6 +172,9 @@ impl Session {
             response.capability_flags,
             response.character_set,
         );
+
+        // Step 2.5: For groups mode, select group based on username
+        self.select_group(&response.username)?;
 
         // Step 3: Validate connection by getting one from pool
         // This ensures we can connect to the backend before telling client OK

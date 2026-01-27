@@ -146,6 +146,58 @@ queue_timeout_ms = 5000 # 排队超时（毫秒）
 - 超时：返回 `ERROR 1205 (HY000): Rate limit timeout`
 - 限流失败不断开连接，客户端可继续发送其他查询
 
+### GroupManager (`src/group/`)
+
+**职责：** 管理所有 Group 及其运行时资源
+
+**核心组件：**
+```rust
+/// Group 运行时上下文
+pub struct GroupContext {
+    pub name: String,              // Group 名称
+    pub pool_manager: Arc<PoolManager>,  // 连接池管理器
+    pub router_config: RouterConfig,     // 路由配置
+}
+
+/// Group 管理器
+pub struct GroupManager {
+    groups: DashMap<String, Arc<GroupContext>>,  // name → context
+    health_registry: Arc<InstanceRegistry>,      // 共享健康检查
+    default_group: Option<Arc<GroupContext>>,    // 兼容遗留配置
+}
+```
+
+**运行时 wiring：**
+```
+main() 启动
+    ↓
+Config 加载
+    ↓
+GroupManager::new(&config)
+    ↓
+for group in config.groups:
+    ├── 构建 RouterConfig (分片规则)
+    ├── 构建 PoolManager (为每个 DBGroup 创建 shard 连接池)
+    └── 注册所有 DBInstance 到 HealthRegistry
+    ↓
+Session 创建时引用 GroupManager
+    ↓
+Handshake 完成后根据 username 选择 GroupContext
+    ↓
+Session 使用对应的 PoolManager 和 Router
+```
+
+**Session 集成：**
+```rust
+// Session 根据 username 选择 Group
+fn select_group(&mut self, username: &str) -> Result<(), SessionError> {
+    let ctx = self.group_manager.get_for_user(username)?;
+    self.pool_manager = ctx.pool_manager.clone();
+    self.router = Router::new(ctx.router_config.clone());
+    Ok(())
+}
+```
+
 ### 读写分离 (Read-Write Splitting)
 
 **路由规则：**

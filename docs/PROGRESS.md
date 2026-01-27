@@ -432,6 +432,44 @@ max_queue_size = 50
 
 ---
 
+### Phase 11: Groups-only 运行时 wiring ✅ 完成
+
+**目标：** 使用 groups 配置完全替代遗留 backend 配置，实现多租户运行时
+
+**完成内容：**
+
+#### 11.1 GroupManager 模块
+- [x] `GroupManager` - 管理所有 Group 及其运行时资源
+- [x] `GroupContext` - 单个 Group 的运行时上下文
+- [x] 按 username 查找 Group（1:1 映射）
+- [x] 共享 HealthRegistry 跨所有 Group
+
+#### 11.2 Session 集成
+- [x] Session 支持两种模式：Legacy（直接 PoolManager）和 Groups（GroupManager）
+- [x] Handshake 完成后根据 username 选择 GroupContext
+- [x] 动态设置 pool_manager 和 router
+
+#### 11.3 健康检查集成
+- [x] GroupManager 初始化时自动注册所有 DBInstance 到 HealthRegistry
+- [x] WindowConfig 从 failure_threshold 自动生成
+- [x] 原子性的实例注册（避免并发 spawn 竞态）
+
+#### 11.4 Metrics 扩展
+- [x] `athena_health_check_total` - 健康检查结果计数（按 success/failure/timeout）
+- [x] `athena_health_instances` - 当前实例健康状态分布
+
+**文件变更：**
+- `src/group/mod.rs` - 新增：模块入口
+- `src/group/manager.rs` - 新增：GroupManager, GroupContext
+- `src/main.rs` - 使用 GroupManager 替代直接 PoolManager
+- `src/session/mod.rs` - 支持 with_group_manager，select_group
+- `src/health/registry.rs` - 原子性注册，避免竞态
+- `src/health/state.rs` - WindowConfig::from_failure_threshold
+- `src/metrics/mod.rs` - 健康检查指标
+- `src/config/schema.rs` - BackendConfig::default()
+
+---
+
 ## 目录结构
 
 ```
@@ -442,6 +480,9 @@ athena-rs/
 │   ├── config/
 │   │   ├── mod.rs
 │   │   └── schema.rs           # Group/DBGroup/DBInstance/LimiterConfig
+│   ├── group/
+│   │   ├── mod.rs
+│   │   └── manager.rs          # GroupManager, GroupContext
 │   ├── protocol/
 │   │   ├── mod.rs
 │   │   ├── packet.rs

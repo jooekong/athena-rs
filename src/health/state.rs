@@ -56,6 +56,21 @@ impl Default for WindowConfig {
     }
 }
 
+impl WindowConfig {
+    /// Create from HealthCheckConfig's failure_threshold
+    ///
+    /// Maps failure_threshold to unhealthy_threshold, uses same value for healthy_threshold
+    pub fn from_failure_threshold(threshold: u32) -> Self {
+        let threshold = threshold.max(1) as usize;
+        Self {
+            window_size: threshold * 2, // Window size is 2x threshold
+            unhealthy_threshold: threshold,
+            healthy_threshold: threshold, // Same for recovery
+            min_samples: (threshold / 2).max(1), // At least half threshold samples
+        }
+    }
+}
+
 /// Health state for a single DBInstance using sliding window
 #[derive(Debug)]
 pub struct InstanceHealth {

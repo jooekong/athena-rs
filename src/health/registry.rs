@@ -64,19 +64,24 @@ impl InstanceRegistry {
     pub fn register(&self, config: &DBInstanceConfig) -> Arc<RwLock<InstanceHealth>> {
         let addr = config.addr();
 
-        // Check if this is a new instance
-        let is_new = !self.instances.contains_key(&addr);
+        // Create window config from failure_threshold
+        let window_config = super::state::WindowConfig::from_failure_threshold(
+            self.config.failure_threshold,
+        );
 
-        // Get or create health state
+        // Atomically get or create health state, tracking if we inserted
+        let mut is_new = false;
         let health = self
             .instances
             .entry(addr.clone())
             .or_insert_with(|| {
+                is_new = true;
                 info!(addr = %addr, "Registering new instance for health checks");
-                Arc::new(RwLock::new(InstanceHealth::new(
+                Arc::new(RwLock::new(InstanceHealth::with_config(
                     addr.clone(),
                     config.user.clone(),
                     config.password.clone(),
+                    window_config.clone(),
                 )))
             })
             .clone();
@@ -87,7 +92,7 @@ impl InstanceRegistry {
             .and_modify(|c| *c += 1)
             .or_insert(1);
 
-        // Spawn health check task for new instances
+        // Spawn health check task for new instances (only if we just inserted)
         if is_new && self.config.enabled {
             self.spawn_check_task(addr.clone(), health.clone());
         }

@@ -1,5 +1,6 @@
 mod circuit;
 mod config;
+mod group;
 mod health;
 mod metrics;
 mod parser;
@@ -20,8 +21,7 @@ use tracing_subscriber::EnvFilter;
 
 use circuit::{ConcurrencyController, LimitConfig};
 use config::Config;
-use pool::{PoolManager, StatelessPoolConfig};
-use router::RouterConfig;
+use group::GroupManager;
 use session::Session;
 
 /// Global connection counter for generating unique session IDs
@@ -44,13 +44,19 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let config = load_or_default_config();
 
-    // Create pool manager
-    let pool_manager = Arc::new(PoolManager::new(
-        config.backend.clone(),
-        StatelessPoolConfig::default(),
-    ));
+    // Create group manager (groups-only architecture)
+    let group_manager = Arc::new(GroupManager::new(&config).await);
 
-    // Create concurrency controller for rate limiting
+    if group_manager.has_groups() {
+        info!(
+            groups = ?group_manager.group_names(),
+            "Groups configured (groups-only mode)"
+        );
+    } else {
+        info!("No groups configured, using legacy backend as default");
+    }
+
+    // Create concurrency controller for rate limiting (legacy, will migrate to per-instance)
     let limit_config = LimitConfig::from(&config.circuit);
     let concurrency_controller = Arc::new(ConcurrencyController::new(limit_config));
 
@@ -61,21 +67,6 @@ async fn main() -> anyhow::Result<()> {
         queue_timeout_ms = config.circuit.queue_timeout_ms,
         "Circuit breaker configured"
     );
-
-    // Build router config from sharding rules
-    let mut router_config = RouterConfig::new();
-    for rule in &config.sharding {
-        info!(
-            name = %rule.name,
-            table = %rule.table_pattern,
-            column = %rule.shard_column,
-            algorithm = %rule.algorithm,
-            shard_count = rule.shard_count,
-            "Loaded sharding rule"
-        );
-        router_config.add_rule(rule.clone());
-    }
-    let router_config = Arc::new(router_config);
 
     let addr = format!("{}:{}", config.server.listen_addr, config.server.listen_port);
     let listener = TcpListener::bind(&addr).await?;
@@ -118,19 +109,17 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 let session_id = CONNECTION_COUNTER.fetch_add(1, Ordering::SeqCst);
-                let pool_manager = pool_manager.clone();
+                let group_manager = group_manager.clone();
                 let concurrency_controller = concurrency_controller.clone();
-                let router_config = (*router_config).clone();
 
                 info!(session_id = session_id, peer = %peer_addr, "New connection");
                 metrics::metrics().record_connection_accepted();
 
                 sessions.spawn(async move {
-                    let session = Session::with_router(
+                    let session = Session::with_group_manager(
                         session_id,
-                        pool_manager,
+                        group_manager,
                         concurrency_controller,
-                        router_config,
                     );
                     if let Err(e) = session.run(stream).await {
                         warn!(session_id = session_id, error = %e, "Session ended with error");
