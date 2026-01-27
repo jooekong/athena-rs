@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{BackendConfig, Config, DBGroupConfig, DBInstanceConfig, GroupConfig};
 use crate::health::InstanceRegistry;
@@ -115,7 +115,16 @@ impl GroupManager {
             .first()
             .and_then(|dg| dg.primary_master())
             .map(|inst| inst.to_backend_config())
-            .unwrap_or_else(BackendConfig::default);
+            .unwrap_or_else(|| {
+                // This is a configuration error - no db_groups or no masters configured
+                // Log error but don't panic - let the connection fail at runtime
+                // with a clear error message
+                error!(
+                    "No db_groups configured or no master in first db_group! \
+                     Connections will fail. Please check your configuration."
+                );
+                BackendConfig::default()
+            });
 
         let pool_manager = PoolManager::new(default_backend, pool_config.clone());
 
@@ -132,9 +141,10 @@ impl GroupManager {
                 .first()
                 .map(|m| m.to_backend_config())
                 .unwrap_or_else(|| {
-                    warn!(
+                    // This is a configuration error - shard has no master
+                    error!(
                         shard = %db_group.shard_id,
-                        "No master configured, using default"
+                        "No master configured for shard! Queries to this shard will fail."
                     );
                     BackendConfig::default()
                 });

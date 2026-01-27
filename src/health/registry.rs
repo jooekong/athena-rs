@@ -9,12 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::Rng as _;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::{DBInstanceConfig, HealthCheckConfig};
+use crate::metrics::metrics;
 
 use super::master::MasterDetector;
 use super::state::InstanceHealth;
@@ -32,6 +33,8 @@ pub struct InstanceRegistry {
     cancellation_tokens: DashMap<String, CancellationToken>,
     /// Health check configuration
     config: HealthCheckConfig,
+    /// Lock for atomic registration (prevents race between insert and spawn)
+    register_lock: Mutex<()>,
 }
 
 impl Default for InstanceRegistry {
@@ -53,6 +56,7 @@ impl InstanceRegistry {
             ref_counts: DashMap::new(),
             cancellation_tokens: DashMap::new(),
             config,
+            register_lock: Mutex::new(()),
         }
     }
 
@@ -69,33 +73,38 @@ impl InstanceRegistry {
             self.config.failure_threshold,
         );
 
-        // Atomically get or create health state, tracking if we inserted
-        let mut is_new = false;
-        let health = self
-            .instances
-            .entry(addr.clone())
-            .or_insert_with(|| {
-                is_new = true;
-                info!(addr = %addr, "Registering new instance for health checks");
-                Arc::new(RwLock::new(InstanceHealth::with_config(
-                    addr.clone(),
-                    config.user.clone(),
-                    config.password.clone(),
-                    window_config.clone(),
-                )))
-            })
-            .clone();
+        // Hold lock during entire registration to prevent race conditions:
+        // - Between checking if instance exists and spawning health check task
+        // - Between multiple concurrent registrations of the same address
+        let _guard = self.register_lock.lock();
 
-        // Increment reference count
-        self.ref_counts
-            .entry(addr.clone())
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
+        // Check if already registered (fast path)
+        let is_new = !self.instances.contains_key(&addr);
 
-        // Spawn health check task for new instances (only if we just inserted)
-        if is_new && self.config.enabled {
-            self.spawn_check_task(addr.clone(), health.clone());
-        }
+        let health = if is_new {
+            info!(addr = %addr, "Registering new instance for health checks");
+            let health = Arc::new(RwLock::new(InstanceHealth::with_config(
+                addr.clone(),
+                config.user.clone(),
+                config.password.clone(),
+                window_config,
+            )));
+            self.instances.insert(addr.clone(), health.clone());
+            self.ref_counts.insert(addr.clone(), 1);
+
+            // Spawn health check task (under lock to ensure single spawn)
+            if self.config.enabled {
+                self.spawn_check_task(addr.clone(), health.clone());
+            }
+
+            health
+        } else {
+            // Increment reference count for existing instance
+            self.ref_counts
+                .entry(addr.clone())
+                .and_modify(|c| *c += 1);
+            self.instances.get(&addr).unwrap().clone()
+        };
 
         debug!(addr = %addr, ref_count = ?self.ref_counts.get(&addr).map(|r| *r), "Instance registered");
         health
@@ -159,6 +168,7 @@ impl InstanceRegistry {
 
         match result {
             Ok(Ok(role)) => {
+                metrics().record_health_check("success");
                 let mut h = health.write();
                 let changed = h.record_success(Some(role));
                 if changed {
@@ -173,6 +183,7 @@ impl InstanceRegistry {
                 }
             }
             Ok(Err(e)) => {
+                metrics().record_health_check("failure");
                 // Connection failed, clear cached connection
                 *conn = None;
                 let mut h = health.write();
@@ -184,6 +195,7 @@ impl InstanceRegistry {
                 }
             }
             Err(_) => {
+                metrics().record_health_check("timeout");
                 // Timeout, clear cached connection
                 *conn = None;
                 let mut h = health.write();
@@ -256,6 +268,9 @@ impl InstanceRegistry {
     /// Decrements reference count. If count reaches 0, cancels the health check task
     /// and removes the instance.
     pub fn unregister(&self, addr: &str) {
+        // Hold lock to prevent race with concurrent register/unregister
+        let _guard = self.register_lock.lock();
+
         let should_remove = {
             let mut entry = match self.ref_counts.get_mut(addr) {
                 Some(e) => e,
@@ -276,6 +291,14 @@ impl InstanceRegistry {
             info!(addr = %addr, "Instance unregistered and health check task cancelled");
         } else {
             debug!(addr = %addr, ref_count = ?self.ref_counts.get(addr).map(|r| *r), "Instance unregistered (still has references)");
+        }
+    }
+
+    /// Cancel all health check tasks (for graceful shutdown)
+    pub fn shutdown(&self) {
+        info!("Shutting down health check registry");
+        for entry in self.cancellation_tokens.iter() {
+            entry.value().cancel();
         }
     }
 
@@ -346,6 +369,16 @@ pub struct RegistryStats {
     pub healthy: usize,
     pub unhealthy: usize,
     pub unknown: usize,
+}
+
+impl Drop for InstanceRegistry {
+    fn drop(&mut self) {
+        // Cancel all health check tasks on shutdown
+        for entry in self.cancellation_tokens.iter() {
+            entry.value().cancel();
+        }
+        debug!("InstanceRegistry dropped, all health check tasks cancelled");
+    }
 }
 
 #[cfg(test)]
