@@ -47,6 +47,8 @@ pub struct Session {
     concurrency_controller: Arc<ConcurrencyController>,
     /// SQL analyzer
     analyzer: SqlAnalyzer,
+    /// Auth scramble data (used for password verification)
+    auth_scramble: Option<Vec<u8>>,
 }
 
 impl Session {
@@ -63,6 +65,7 @@ impl Session {
             group_manager: None,
             concurrency_controller,
             analyzer: SqlAnalyzer::new(),
+            auth_scramble: None,
         }
     }
 
@@ -81,12 +84,13 @@ impl Session {
             group_manager: None,
             concurrency_controller,
             analyzer: SqlAnalyzer::new(),
+            auth_scramble: None,
         }
     }
 
     /// Create session with group manager (groups-only mode)
     ///
-    /// Pool manager and router will be set after handshake based on username.
+    /// Pool manager and router will be set after handshake based on database.
     pub fn with_group_manager(
         id: u32,
         group_manager: Arc<GroupManager>,
@@ -117,20 +121,54 @@ impl Session {
             group_manager: Some(group_manager),
             concurrency_controller,
             analyzer: SqlAnalyzer::new(),
+            auth_scramble: None,
         }
     }
 
-    /// Select group and update pool manager/router based on username
-    fn select_group(&mut self, username: &str) -> Result<(), SessionError> {
+    /// Select group and update pool manager/router based on database name
+    ///
+    /// Also validates proxy-level authentication (username + password).
+    fn select_group(
+        &mut self,
+        database: Option<&str>,
+        username: &str,
+        auth_response: &[u8],
+    ) -> Result<(), SessionError> {
         if let Some(ref gm) = self.group_manager {
-            let ctx = gm.get_for_user(username).ok_or_else(|| {
-                SessionError::Protocol(format!("No group found for user '{}'", username))
+            // Get group by database name
+            let db_name = database.ok_or_else(|| {
+                SessionError::Auth("Database name is required for group selection".into())
             })?;
+
+            let ctx = gm.get_by_database(db_name).ok_or_else(|| {
+                SessionError::Auth(format!("No group found for database '{}'", db_name))
+            })?;
+
+            // Validate username matches group's auth_user
+            if ctx.auth_user != username {
+                return Err(SessionError::Auth(format!(
+                    "Access denied for user '{}' to database '{}'",
+                    username, db_name
+                )));
+            }
+
+            // Validate password using stored scramble
+            if let Some(ref scramble) = self.auth_scramble {
+                let expected = crate::protocol::compute_auth_response(&ctx.auth_password, scramble);
+                if auth_response != expected {
+                    return Err(SessionError::Auth(format!(
+                        "Access denied for user '{}' (incorrect password)",
+                        username
+                    )));
+                }
+            }
+
             info!(
                 session_id = self.id,
                 username = %username,
+                database = %db_name,
                 group = %ctx.name,
-                "Selected group for user"
+                "Selected group and authenticated"
             );
             self.pool_manager = ctx.pool_manager.clone();
             self.router = Router::new(ctx.router_config.clone());
@@ -147,6 +185,8 @@ impl Session {
 
         // Step 1: Send initial handshake to client
         let handshake = InitialHandshake::new(self.id);
+        // Store scramble data for password verification
+        self.auth_scramble = Some(handshake.auth_plugin_data());
         client.send(handshake.encode()).await?;
 
         // Step 2: Receive handshake response from client
@@ -173,8 +213,19 @@ impl Session {
             response.character_set,
         );
 
-        // Step 2.5: For groups mode, select group based on username
-        self.select_group(&response.username)?;
+        // Step 2.5: For groups mode, select group based on database and validate auth
+        if let Err(e) = self.select_group(
+            response.database.as_deref(),
+            &response.username,
+            &response.auth_response,
+        ) {
+            // Send ERR packet for auth failure
+            let err = ErrPacket::new(1045, "28000", &e.to_string());
+            client
+                .send(err.encode(2, self.state.capability_flags))
+                .await?;
+            return Err(e);
+        }
 
         // Step 3: Validate connection by getting one from pool
         // This ensures we can connect to the backend before telling client OK
@@ -238,8 +289,45 @@ impl Session {
                 return Ok(());
             }
 
+            // Block USE DATABASE command (COM_INIT_DB)
+            // Database switching is not allowed after connection
+            if let ClientCommand::InitDb(ref db) = cmd {
+                warn!(
+                    session_id = self.id,
+                    database = %db,
+                    "Blocked USE DATABASE command"
+                );
+                let err = ErrPacket::new(
+                    1049,
+                    "42000",
+                    "Database switching is not allowed. Please reconnect with the desired database.",
+                );
+                client
+                    .send(err.encode(1, self.state.capability_flags))
+                    .await?;
+                continue;
+            }
+
             // Handle SQL queries with routing
             if let ClientCommand::Query(ref sql) = cmd {
+                // Block USE statement in SQL
+                if self.is_use_database_sql(sql) {
+                    warn!(
+                        session_id = self.id,
+                        sql = %sql,
+                        "Blocked USE DATABASE SQL statement"
+                    );
+                    let err = ErrPacket::new(
+                        1049,
+                        "42000",
+                        "Database switching is not allowed. Please reconnect with the desired database.",
+                    );
+                    client
+                        .send(err.encode(1, self.state.capability_flags))
+                        .await?;
+                    continue;
+                }
+
                 self.handle_query(client, sql, &packet).await?;
                 continue;
             }
@@ -271,12 +359,6 @@ impl Session {
                 // Use stateless connection from pool
                 self.execute_with_pooled_ex(client, packet, &shard_id, RouteTarget::Master, single_eof)
                     .await?;
-            }
-
-            // Update state AFTER successful backend execution
-            // This ensures state consistency on backend failure
-            if let ClientCommand::InitDb(ref db) = cmd {
-                self.state.change_database(db.clone());
             }
 
             // Handle transaction end
@@ -1131,6 +1213,12 @@ impl Session {
 
         Some((var_name, var_value))
     }
+
+    /// Check if SQL is a USE DATABASE statement
+    fn is_use_database_sql(&self, sql: &str) -> bool {
+        let upper = sql.trim().to_uppercase();
+        upper.starts_with("USE ") || upper == "USE"
+    }
 }
 
 /// Session errors
@@ -1141,6 +1229,9 @@ pub enum SessionError {
 
     #[error("Protocol error: {0}")]
     Protocol(String),
+
+    #[error("Authentication error: {0}")]
+    Auth(String),
 
     #[error("Client disconnected")]
     ClientDisconnected,

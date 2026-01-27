@@ -4,6 +4,7 @@
 listen_addr = "127.0.0.1"
 listen_port = 3307
 
+# Default backend (used when no groups are configured - legacy mode)
 [backend]
 host = "10.78.81.148"
 port = 3306
@@ -21,6 +22,39 @@ max_concurrent_per_user_shard = 10
 queue_size = 100
 # Timeout in milliseconds for waiting in queue
 queue_timeout_ms = 5000
+
+# =============================================================================
+# Groups Configuration (Multi-tenant mode)
+# =============================================================================
+# 
+# Groups allow multi-tenant database access with:
+# - Group name = Client database name (clients connect with `-D group_name`)
+# - Independent proxy authentication (user/password separate from backend)
+# - USE DATABASE command is blocked (database switching not allowed)
+#
+# Example configuration:
+#
+# [[groups]]
+# name = "athena_rs_test"           # Client connects with: mysql -D athena_rs_test
+# user = "app_user"                  # Proxy authentication username
+# password = "proxy_secret"          # Proxy authentication password (NOT backend password)
+#
+# [[groups.db_groups]]
+# name = "default"
+#
+# [[groups.db_groups.instances]]
+# host = "10.78.81.148"
+# port = 3306
+# user = "rw_dbpaas"                 # Backend MySQL username
+# password = "GpoqEDWg80vO"          # Backend MySQL password
+# database = "athena_rs_test"        # Backend database name
+# role = "master"
+#
+# [groups.db_groups.instances.limiter]
+# enabled = true
+# max_concurrent = 100
+# max_queue_size = 50
+# queue_timeout_ms = 5000
 
 # Sharding rules (optional)
 # Each [[sharding]] block defines a sharding rule for a table

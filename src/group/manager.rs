@@ -15,13 +15,27 @@ use crate::router::RouterConfig;
 /// Contains everything needed to process requests for this group:
 /// - Pool manager for backend connections
 /// - Router config for SQL routing
+/// - Proxy-level authentication (user/password)
 pub struct GroupContext {
-    /// Group name
+    /// Group name (= database name from client's perspective)
     pub name: String,
+    /// Proxy authentication username
+    pub auth_user: String,
+    /// Proxy authentication password
+    pub auth_password: String,
     /// Pool manager for this group's backends
     pub pool_manager: Arc<PoolManager>,
     /// Router configuration (sharding rules)
     pub router_config: RouterConfig,
+}
+
+impl GroupContext {
+    /// Validate proxy-level authentication
+    ///
+    /// Returns true if username and password match the group's auth config
+    pub fn validate_auth(&self, username: &str, password: &str) -> bool {
+        self.auth_user == username && self.auth_password == password
+    }
 }
 
 /// Manages all groups and their resources
@@ -99,6 +113,8 @@ impl GroupManager {
 
         GroupContext {
             name: group_config.name.clone(),
+            auth_user: group_config.user.clone(),
+            auth_password: group_config.password.clone(),
             pool_manager: Arc::new(pool_manager),
             router_config,
         }
@@ -130,7 +146,7 @@ impl GroupManager {
 
         // Add all shards
         for db_group in db_groups {
-            let shard_id = ShardId(db_group.shard_id.clone());
+            let shard_id = ShardId(db_group.name.clone());
 
             // Collect masters and slaves
             let masters: Vec<&DBInstanceConfig> = db_group.masters();
@@ -143,8 +159,8 @@ impl GroupManager {
                 .unwrap_or_else(|| {
                     // This is a configuration error - shard has no master
                     error!(
-                        shard = %db_group.shard_id,
-                        "No master configured for shard! Queries to this shard will fail."
+                        db_group = %db_group.name,
+                        "No master configured for db_group! Queries to this db_group will fail."
                     );
                     BackendConfig::default()
                 });
@@ -189,6 +205,9 @@ impl GroupManager {
 
         GroupContext {
             name: "default".to_string(),
+            // Default group uses backend credentials for proxy auth (legacy mode)
+            auth_user: backend.user.clone(),
+            auth_password: backend.password.clone(),
             pool_manager: Arc::new(pool_manager),
             router_config: RouterConfig::new(),
         }
@@ -201,10 +220,19 @@ impl GroupManager {
         self.groups.get(name).map(|r| r.value().clone())
     }
 
-    /// Get group for a username
+    /// Get group by database name
+    ///
+    /// Group name = database name (client connects with database that maps to group)
+    /// Falls back to default group if not found.
+    pub fn get_by_database(&self, database: &str) -> Option<Arc<GroupContext>> {
+        self.get(database).or_else(|| self.default_group.clone())
+    }
+
+    /// Get group for a username (deprecated, use get_by_database instead)
     ///
     /// In groups-only mode, username maps 1:1 to group name.
     /// Falls back to default group if not found.
+    #[deprecated(note = "Use get_by_database instead")]
     pub fn get_for_user(&self, username: &str) -> Option<Arc<GroupContext>> {
         self.get(username).or_else(|| self.default_group.clone())
     }

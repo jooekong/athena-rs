@@ -72,14 +72,20 @@ impl Default for HealthCheckConfig {
 // Group / DBGroup / DBInstance Configuration
 // ============================================================================
 
-/// Group: Client-facing logical database (1:1 with tenant/user)
+/// Group: Client-facing logical database (1:1 with tenant)
 ///
 /// A Group represents a virtual database from the client's perspective.
-/// Each tenant has their own Group, which maps to one or more DBGroups.
+/// The group name is what clients use as the database name when connecting.
+/// Each group has its own proxy-level authentication (user/password) that is
+/// independent from the backend MySQL credentials.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GroupConfig {
-    /// Unique group name (used as identifier)
+    /// Group name (clients connect using this as database name)
     pub name: String,
+    /// Proxy authentication username
+    pub user: String,
+    /// Proxy authentication password (NOT the backend MySQL password)
+    pub password: String,
     /// Database groups (shards) in this group
     #[serde(default)]
     pub db_groups: Vec<DBGroupConfig>,
@@ -94,8 +100,8 @@ pub struct GroupConfig {
 /// In a sharded setup, each shard has its own DBGroup.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DBGroupConfig {
-    /// Shard identifier (e.g., "shard_0", "shard_1")
-    pub shard_id: String,
+    /// Group name (used as shard identifier for routing, e.g., "default", "shard_0")
+    pub name: String,
     /// Database instances in this group
     pub instances: Vec<DBInstanceConfig>,
 }
@@ -382,9 +388,11 @@ password = ""
 
 [[groups]]
 name = "tenant_a"
+user = "app_user"
+password = "proxy_secret"
 
 [[groups.db_groups]]
-shard_id = "shard_0"
+name = "shard_0"
 
 [[groups.db_groups.instances]]
 host = "mysql-1"
@@ -410,8 +418,10 @@ max_concurrent = 200
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.groups.len(), 1);
         assert_eq!(config.groups[0].name, "tenant_a");
+        assert_eq!(config.groups[0].user, "app_user");
+        assert_eq!(config.groups[0].password, "proxy_secret");
         assert_eq!(config.groups[0].db_groups.len(), 1);
-        assert_eq!(config.groups[0].db_groups[0].shard_id, "shard_0");
+        assert_eq!(config.groups[0].db_groups[0].name, "shard_0");
         assert_eq!(config.groups[0].db_groups[0].instances.len(), 2);
 
         let master = &config.groups[0].db_groups[0].instances[0];
@@ -537,7 +547,7 @@ queue_timeout_ms = 3000
     #[test]
     fn test_db_group_config_masters_slaves() {
         let db_group = DBGroupConfig {
-            shard_id: "shard_0".to_string(),
+            name: "shard_0".to_string(),
             instances: vec![
                 DBInstanceConfig {
                     host: "master-1".to_string(),
@@ -587,7 +597,7 @@ queue_timeout_ms = 3000
     #[test]
     fn test_db_group_config_no_slaves() {
         let db_group = DBGroupConfig {
-            shard_id: "shard_0".to_string(),
+            name: "shard_0".to_string(),
             instances: vec![DBInstanceConfig {
                 host: "master-1".to_string(),
                 port: 3306,
