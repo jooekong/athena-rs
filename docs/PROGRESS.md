@@ -380,6 +380,58 @@ max_queue_size = 50
 
 ---
 
+### Phase 10: 健康检查模块 ✅ 完成
+
+**目标：** 实现后端实例健康检查，支持自动摘除故障实例和 Master 选主
+
+**完成内容：**
+
+#### 10.1 健康状态管理（滑动窗口）
+- [x] `InstanceHealth` - 实例健康状态（Healthy/Unhealthy/Unknown）
+- [x] `HealthStatus` - 状态枚举
+- [x] `WindowConfig` - 滑动窗口配置
+- [x] 滑动窗口防抖，避免单次成功/失败导致状态抖动
+- [x] 状态转换需要持续的成功/失败信号
+
+#### 10.2 实例注册表（多租户去重）
+- [x] `InstanceRegistry` - 按 host:port 去重
+- [x] 引用计数，支持多 Group 共享同一实例
+- [x] `is_healthy()` / `is_available()` 状态查询
+
+#### 10.3 Master 检测
+- [x] `MasterDetector` - 检测实例角色
+- [x] 查询 `@@read_only` 变量
+- [x] 查询 `SHOW SLAVE STATUS`
+- [x] 规则：`read_only=0 AND 无 slave status` = Master
+
+#### 10.4 健康检查后台任务
+- [x] 每实例一个长驻检查任务（无 spawn 开销）
+- [x] 注册时自动启动任务，注销时自动取消
+- [x] 随机初始延迟实现错峰检查
+- [x] 持久连接（任务独占，无全局锁）
+- [x] 合并查询 `SELECT 1, @@read_only`（减少 RTT）
+- [x] 超时控制
+
+#### 10.5 Selector 集成
+- [x] `select_healthy()` - 选择健康实例
+- [x] `select_healthy_with_target()` - 返回实际使用的 target
+- [x] 自动过滤不健康实例，支持 fallback
+
+#### 10.6 配置
+- [x] `HealthCheckConfig` - 健康检查配置
+- [x] 默认值：间隔 5s，阈值 5 次，超时 3s
+
+**文件变更：**
+- `src/health/mod.rs` - 模块入口
+- `src/health/state.rs` - InstanceHealth, HealthStatus
+- `src/health/registry.rs` - InstanceRegistry（去重）
+- `src/health/master.rs` - MasterDetector（角色检测）
+- `src/health/checker.rs` - HealthChecker（后台任务）
+- `src/router/selector.rs` - 健康实例选择方法
+- `src/config/schema.rs` - HealthCheckConfig
+
+---
+
 ## 目录结构
 
 ```
@@ -415,6 +467,12 @@ athena-rs/
 │   ├── circuit/
 │   │   ├── mod.rs
 │   │   └── limiter.rs          # 简化的 Limiter（可内嵌）
+│   ├── health/
+│   │   ├── mod.rs              # 健康检查模块入口
+│   │   ├── state.rs            # InstanceHealth, HealthStatus
+│   │   ├── registry.rs         # InstanceRegistry（多租户去重）
+│   │   ├── master.rs           # MasterDetector（角色检测）
+│   │   └── checker.rs          # HealthChecker（后台任务）
 │   ├── metrics/
 │   │   └── mod.rs              # Prometheus 指标 + HTTP 端点
 │   └── session/

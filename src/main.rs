@@ -1,5 +1,6 @@
 mod circuit;
 mod config;
+mod health;
 mod metrics;
 mod parser;
 mod pool;

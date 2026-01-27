@@ -214,6 +214,101 @@ if analysis.stmt_type == StatementType::Set {
 }
 ```
 
+### 健康检查 (Health Check)
+
+**设计目标：**
+1. 定时检查后端 DB 实例健康状态
+2. 滑动窗口防抖，避免状态抖动
+3. 多租户共享同一物理实例的心跳（按 host:port 去重）
+4. 自动检测 Master/Slave 角色，支持选主
+
+**架构：**
+```
+┌────────────────────────────────────────────┐
+│          InstanceRegistry (核心)            │
+│  - 按 host:port 去重，引用计数               │
+│  - 注册时 spawn 长驻检查任务                 │
+│  - 注销时 cancel 对应任务                   │
+└──────────────────┬─────────────────────────┘
+                   │ 每个实例一个长驻任务
+┌──────────────────▼─────────────────────────┐
+│        Health Check Task (per instance)     │
+│  - 独立 ticker，错峰检查                     │
+│  - 持久连接，任务独占                        │
+│  - SELECT 1, @@read_only 合并查询           │
+└────────────────────────────────────────────┘
+```
+
+**性能优化：**
+1. **长驻任务**：每个实例一个独立后台任务，无 spawn 开销
+2. **错峰检查**：随机初始延迟，避免所有实例同时检查
+3. **持久连接**：每个任务独占自己的连接，无全局锁
+4. **合并查询**：`SELECT 1, @@read_only` 减少 RTT
+
+**滑动窗口状态管理：**
+```
+窗口大小: 10 次检查结果
+
+状态转换条件:
+┌─────────┐                              ┌───────────┐
+│ Unknown │ ──(失败数>=5)──────────────> │ Unhealthy │
+│         │ <──(成功数>=5)────────────── │           │
+└────┬────┘                              └─────┬─────┘
+     │                                         │
+     │ (成功数>=5)                    (成功数>=5)
+     ▼                                         │
+┌─────────┐                                    │
+│ Healthy │ <──────────────────────────────────┘
+│         │ ──(失败数>=5)──> Unhealthy
+└─────────┘
+
+防抖效果:
+- 单次失败不会导致下线
+- 单次成功不会立即恢复
+- 避免网络抖动导致状态频繁切换
+```
+
+**Master 检测逻辑：**
+```rust
+// 条件: @@read_only = 0 AND SHOW SLAVE STATUS 为空
+pub async fn is_master(conn: &mut PooledConnection) -> bool {
+    let read_only = query("SELECT @@read_only"); // 0 = master
+    let slave_status = query("SHOW SLAVE STATUS"); // 空 = master
+    !read_only && slave_status.is_empty()
+}
+```
+
+**健康状态：**
+- `Healthy` - 窗口中成功数 >= 阈值
+- `Unhealthy` - 窗口中失败数 >= 阈值
+- `Unknown` - 样本不足或无明确信号
+
+**窗口配置：**
+```rust
+WindowConfig {
+    window_size: 10,         // 窗口大小
+    unhealthy_threshold: 5,  // 失败数达到此值 → Unhealthy
+    healthy_threshold: 5,    // 成功数达到此值 → Healthy
+    min_samples: 3,          // 最小样本数才能判定
+}
+```
+
+**配置：**
+```toml
+[health]
+enabled = true
+check_interval_ms = 5000   # 检查间隔
+check_timeout_ms = 3000    # 单次检查超时
+```
+
+**与 Selector 集成：**
+```rust
+// 选择健康的实例
+router.select_healthy(&db_group, RouteTarget::Slave, &registry)
+
+// 自动过滤不健康实例，支持 fallback
+```
+
 ---
 
 ## 模块设计

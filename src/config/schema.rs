@@ -13,8 +13,59 @@ pub struct Config {
     /// Legacy circuit config (deprecated, use group-level config instead)
     #[serde(default)]
     pub circuit: CircuitConfig,
+    /// Health check configuration
+    #[serde(default)]
+    pub health: HealthCheckConfig,
     #[serde(default)]
     pub sharding: Vec<ShardingRule>,
+}
+
+// ============================================================================
+// Health Check Configuration
+// ============================================================================
+
+/// Health check configuration for backend instances
+#[derive(Debug, Clone, Deserialize)]
+pub struct HealthCheckConfig {
+    /// Whether health checks are enabled
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+    /// Interval between checks (milliseconds)
+    #[serde(default = "default_check_interval_ms")]
+    pub check_interval_ms: u64,
+    /// Number of consecutive failures before marking unhealthy
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    /// Timeout for each health check (milliseconds)
+    #[serde(default = "default_check_timeout_ms")]
+    pub check_timeout_ms: u64,
+}
+
+fn default_health_enabled() -> bool {
+    true
+}
+
+fn default_check_interval_ms() -> u64 {
+    5000
+}
+
+fn default_failure_threshold() -> u32 {
+    5
+}
+
+fn default_check_timeout_ms() -> u64 {
+    3000
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_health_enabled(),
+            check_interval_ms: default_check_interval_ms(),
+            failure_threshold: default_failure_threshold(),
+            check_timeout_ms: default_check_timeout_ms(),
+        }
+    }
 }
 
 // ============================================================================
@@ -207,6 +258,7 @@ impl Default for Config {
             },
             groups: Vec::new(),
             circuit: CircuitConfig::default(),
+            health: HealthCheckConfig::default(),
             sharding: Vec::new(),
         }
     }
@@ -527,5 +579,39 @@ queue_timeout_ms = 3000
         assert!(!db_group.has_slaves());
         assert!(db_group.slaves().is_empty());
         assert!(db_group.primary_master().is_some());
+    }
+
+    #[test]
+    fn test_health_check_config_defaults() {
+        let health = HealthCheckConfig::default();
+        assert!(health.enabled);
+        assert_eq!(health.check_interval_ms, 5000);
+        assert_eq!(health.failure_threshold, 5);
+        assert_eq!(health.check_timeout_ms, 3000);
+    }
+
+    #[test]
+    fn test_parse_config_with_health() {
+        let toml = r#"
+[server]
+listen_addr = "127.0.0.1"
+
+[backend]
+host = "localhost"
+port = 3306
+user = "root"
+password = ""
+
+[health]
+enabled = true
+check_interval_ms = 10000
+failure_threshold = 3
+check_timeout_ms = 5000
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.health.enabled);
+        assert_eq!(config.health.check_interval_ms, 10000);
+        assert_eq!(config.health.failure_threshold, 3);
+        assert_eq!(config.health.check_timeout_ms, 5000);
     }
 }
