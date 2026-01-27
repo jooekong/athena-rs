@@ -5,7 +5,10 @@ pub use state::SessionState;
 use crate::circuit::{ConcurrencyController, LimitError, LimitKey, LimitPermit};
 use crate::group::{GroupContext, GroupManager};
 use crate::metrics::metrics;
-use crate::parser::{SqlAnalyzer, StatementType};
+use crate::parser::{
+    AggregateInfo, AggregateMerger, AggregateValue, RowParser, SqlAnalysis, SqlAnalyzer,
+    StatementType,
+};
 use crate::pool::{ConnectionError, PoolManager, PooledConnection, ShardId};
 use crate::protocol::{
     capabilities, is_eof_packet, is_err_packet, is_ok_packet, ClientCommand, ErrPacket,
@@ -610,7 +613,7 @@ impl Session {
             }
 
             let scatter_start = Instant::now();
-            self.execute_scatter(client, &route_result).await?;
+            self.execute_scatter(client, &route_result, &analysis).await?;
             let scatter_elapsed = scatter_start.elapsed();
             info!(
                 session_id = self.id,
@@ -751,13 +754,358 @@ impl Session {
         &self,
         client: &mut Framed<C, PacketCodec>,
         route_result: &RouteResult,
+        analysis: &SqlAnalysis,
     ) -> Result<(), SessionError>
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
-        // For now, execute sequentially on each shard and merge results
-        // TODO: parallel execution and proper result merging
+        // Check if this query has aggregate functions that need merging
+        let has_aggregates = !analysis.aggregates.is_empty();
 
+        if has_aggregates {
+            // Aggregation mode: collect results from all shards and merge
+            self.execute_scatter_aggregate(client, route_result, &analysis.aggregates)
+                .await
+        } else {
+            // Non-aggregation mode: stream results from all shards
+            self.execute_scatter_stream(client, route_result).await
+        }
+    }
+
+    /// Execute scatter query with aggregation merging
+    async fn execute_scatter_aggregate<C>(
+        &self,
+        client: &mut Framed<C, PacketCodec>,
+        route_result: &RouteResult,
+        aggregates: &[AggregateInfo],
+    ) -> Result<(), SessionError>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
+        // Initialize mergers for each aggregate
+        let mut mergers: Vec<AggregateMerger> = aggregates
+            .iter()
+            .cloned()
+            .map(AggregateMerger::new)
+            .collect();
+
+        let mut column_definitions: Vec<Packet> = Vec::new();
+        let mut column_count = 0u64;
+        let mut first_shard = true;
+
+        // Collect data from all shards
+        for shard_id in &route_result.shards {
+            // Acquire rate limit permit
+            let _permit = match self.acquire_permit(&shard_id.0, client).await? {
+                AcquireResult::Acquired(permit) => Some(permit),
+                AcquireResult::Disabled => None,
+                AcquireResult::Rejected => return Ok(()),
+            };
+
+            let rewritten_sql = route_result
+                .rewritten_sqls
+                .get(shard_id)
+                .ok_or_else(|| SessionError::Protocol("Missing rewritten SQL".into()))?;
+
+            debug!(
+                session_id = self.id,
+                shard = %shard_id.0,
+                sql = %rewritten_sql,
+                "Executing aggregate scatter on shard"
+            );
+
+            // Build and send query
+            let mut payload = vec![0x03]; // COM_QUERY
+            payload.extend(rewritten_sql.as_bytes());
+            let packet = Packet {
+                sequence_id: 0,
+                payload: payload.into(),
+            };
+
+            let mut conn = self
+                .pool_manager
+                .get_for_target(shard_id, route_result.target, None)
+                .await
+                .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
+
+            if let Err(e) = conn.send(packet).await {
+                conn.close();
+                return Err(SessionError::BackendConnect(e.to_string()));
+            }
+
+            // Read response and collect aggregates
+            let result = self
+                .collect_aggregate_results(
+                    &mut conn,
+                    &mut mergers,
+                    &mut column_definitions,
+                    &mut column_count,
+                    first_shard,
+                )
+                .await;
+
+            // Return connection to pool
+            if conn.is_usable() {
+                self.pool_manager
+                    .put_for_target(shard_id, route_result.target, conn)
+                    .await;
+            }
+
+            if let Err(e) = result {
+                warn!(
+                    session_id = self.id,
+                    shard = %shard_id.0,
+                    error = %e,
+                    "Aggregate scatter failed on shard"
+                );
+                // Send error to client
+                let err = ErrPacket::new(1105, "HY000", &format!("Shard error: {}", e));
+                client.send(err.encode(1, self.state.capability_flags)).await?;
+                return Ok(());
+            }
+
+            first_shard = false;
+        }
+
+        // Build and send merged result to client
+        self.send_aggregated_result(client, &mergers, &column_definitions, column_count)
+            .await
+    }
+
+    /// Collect aggregate results from a single shard
+    async fn collect_aggregate_results(
+        &self,
+        conn: &mut PooledConnection,
+        mergers: &mut [AggregateMerger],
+        column_definitions: &mut Vec<Packet>,
+        column_count: &mut u64,
+        first_shard: bool,
+    ) -> Result<(), SessionError> {
+        let backend_caps = conn.capabilities();
+
+        // Read first packet (column count or error)
+        let first_packet = conn.recv().await.map_err(|_| SessionError::BackendDisconnected)?;
+
+        // Check for error
+        if is_err_packet(&first_packet.payload) {
+            return Err(SessionError::Protocol("Backend error".into()));
+        }
+
+        // Check for OK packet (empty result)
+        if is_ok_packet(&first_packet.payload) {
+            return Ok(());
+        }
+
+        // Parse column count
+        let count = self.read_length_encoded_int(&first_packet.payload);
+        if first_shard {
+            *column_count = count;
+        }
+
+        // Read column definitions
+        for _ in 0..count {
+            let col_packet = conn.recv().await.map_err(|_| SessionError::BackendDisconnected)?;
+            if first_shard {
+                column_definitions.push(col_packet);
+            }
+        }
+
+        // Read EOF after columns (for non-DEPRECATE_EOF protocol)
+        if backend_caps & capabilities::CLIENT_DEPRECATE_EOF == 0 {
+            let _eof = conn.recv().await.map_err(|_| SessionError::BackendDisconnected)?;
+        }
+
+        // Read rows and merge aggregates
+        loop {
+            let row_packet = conn.recv().await.map_err(|_| SessionError::BackendDisconnected)?;
+
+            // Check for EOF or OK (end of results)
+            if is_eof_packet(&row_packet.payload, backend_caps)
+                || is_ok_packet(&row_packet.payload)
+            {
+                break;
+            }
+
+            // Check for error
+            if is_err_packet(&row_packet.payload) {
+                return Err(SessionError::Protocol("Backend error in row".into()));
+            }
+
+            // Parse row and merge aggregates
+            let values = RowParser::parse_row(&row_packet.payload, *column_count as usize);
+
+            // Merge each aggregate value
+            for merger in mergers.iter_mut() {
+                if merger.info.position < values.len() {
+                    merger.merge(values[merger.info.position].clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Send aggregated result to client
+    async fn send_aggregated_result<C>(
+        &self,
+        client: &mut Framed<C, PacketCodec>,
+        mergers: &[AggregateMerger],
+        column_definitions: &[Packet],
+        column_count: u64,
+    ) -> Result<(), SessionError>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut seq_id: u8 = 1;
+
+        // Send column count
+        let count_packet = self.build_length_encoded_packet(column_count, seq_id);
+        client.send(count_packet).await?;
+        seq_id += 1;
+
+        // Send column definitions
+        for col_def in column_definitions {
+            let mut packet = col_def.clone();
+            packet.sequence_id = seq_id;
+            client.send(packet).await?;
+            seq_id += 1;
+        }
+
+        // Send EOF after columns
+        let eof = self.build_eof_packet(seq_id);
+        client.send(eof).await?;
+        seq_id += 1;
+
+        // Build merged row values
+        let mut row_values: Vec<AggregateValue> = vec![AggregateValue::Null; column_count as usize];
+        for merger in mergers {
+            if merger.info.position < row_values.len() {
+                row_values[merger.info.position] = merger.finalize();
+            }
+        }
+
+        // Send merged row
+        let row_packet = self.build_row_packet(&row_values, seq_id);
+        client.send(row_packet).await?;
+        seq_id += 1;
+
+        // Send final EOF
+        let final_eof = self.build_eof_packet(seq_id);
+        client.send(final_eof).await?;
+
+        debug!(
+            session_id = self.id,
+            aggregate_count = mergers.len(),
+            "Aggregated scatter result sent"
+        );
+
+        Ok(())
+    }
+
+    /// Build a packet with length-encoded integer
+    fn build_length_encoded_packet(&self, value: u64, sequence_id: u8) -> Packet {
+        use bytes::BufMut;
+        let mut payload = bytes::BytesMut::new();
+
+        if value < 251 {
+            payload.put_u8(value as u8);
+        } else if value < 65536 {
+            payload.put_u8(0xFC);
+            payload.put_u16_le(value as u16);
+        } else if value < 16777216 {
+            payload.put_u8(0xFD);
+            payload.put_u8((value & 0xFF) as u8);
+            payload.put_u8(((value >> 8) & 0xFF) as u8);
+            payload.put_u8(((value >> 16) & 0xFF) as u8);
+        } else {
+            payload.put_u8(0xFE);
+            payload.put_u64_le(value);
+        }
+
+        Packet {
+            sequence_id,
+            payload: payload.freeze(),
+        }
+    }
+
+    /// Build an EOF packet
+    fn build_eof_packet(&self, sequence_id: u8) -> Packet {
+        use bytes::BufMut;
+        let mut payload = bytes::BytesMut::new();
+        payload.put_u8(0xFE); // EOF marker
+        payload.put_u16_le(0); // Warnings
+        payload.put_u16_le(0x0002); // Server status: AUTOCOMMIT
+
+        Packet {
+            sequence_id,
+            payload: payload.freeze(),
+        }
+    }
+
+    /// Build a row packet from aggregate values
+    fn build_row_packet(&self, values: &[AggregateValue], sequence_id: u8) -> Packet {
+        use bytes::BufMut;
+        let mut payload = bytes::BytesMut::new();
+
+        for value in values {
+            match value {
+                AggregateValue::Null => {
+                    payload.put_u8(0xFB); // NULL indicator
+                }
+                _ => {
+                    let encoded = value.encode();
+                    // Write length-encoded string
+                    let len = encoded.len();
+                    if len < 251 {
+                        payload.put_u8(len as u8);
+                    } else if len < 65536 {
+                        payload.put_u8(0xFC);
+                        payload.put_u16_le(len as u16);
+                    } else {
+                        payload.put_u8(0xFD);
+                        payload.put_u8((len & 0xFF) as u8);
+                        payload.put_u8(((len >> 8) & 0xFF) as u8);
+                        payload.put_u8(((len >> 16) & 0xFF) as u8);
+                    }
+                    payload.extend_from_slice(&encoded);
+                }
+            }
+        }
+
+        Packet {
+            sequence_id,
+            payload: payload.freeze(),
+        }
+    }
+
+    /// Read length-encoded integer from payload
+    fn read_length_encoded_int(&self, data: &[u8]) -> u64 {
+        if data.is_empty() {
+            return 0;
+        }
+
+        match data[0] {
+            0x00..=0xFA => data[0] as u64,
+            0xFC if data.len() >= 3 => u16::from_le_bytes([data[1], data[2]]) as u64,
+            0xFD if data.len() >= 4 => {
+                u32::from_le_bytes([data[1], data[2], data[3], 0]) as u64
+            }
+            0xFE if data.len() >= 9 => u64::from_le_bytes([
+                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
+            ]),
+            _ => 0,
+        }
+    }
+
+    /// Execute scatter query by streaming results (non-aggregation)
+    async fn execute_scatter_stream<C>(
+        &self,
+        client: &mut Framed<C, PacketCodec>,
+        route_result: &RouteResult,
+    ) -> Result<(), SessionError>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
         let mut first_shard = true;
         let mut column_count = 0u64;
         let mut sequence_id: u8 = 1; // Response packets start at sequence 1

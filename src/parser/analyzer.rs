@@ -1,6 +1,6 @@
 use sqlparser::ast::{
-    BinaryOperator, Expr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-    TableWithJoins, Value,
+    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, TableWithJoins, Value,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -17,6 +17,31 @@ pub struct SqlAnalysis {
     pub shard_keys: Vec<(String, ShardKeyValue)>,
     /// Whether this is a read-only query
     pub is_read_only: bool,
+    /// Aggregate functions detected in SELECT clause
+    pub aggregates: Vec<AggregateInfo>,
+}
+
+/// Information about an aggregate function in SELECT clause
+#[derive(Debug, Clone)]
+pub struct AggregateInfo {
+    /// Function type (COUNT, SUM, MAX, MIN, AVG)
+    pub func_type: AggregateType,
+    /// Position in SELECT list (0-indexed)
+    pub position: usize,
+    /// Original expression string (for debugging)
+    pub expr_str: String,
+    /// Whether it's COUNT(*)
+    pub is_count_star: bool,
+}
+
+/// Supported aggregate function types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateType {
+    Count,
+    Sum,
+    Max,
+    Min,
+    Avg,
 }
 
 /// Type of SQL statement
@@ -94,6 +119,7 @@ impl SqlAnalyzer {
                 tables: vec![],
                 shard_keys: vec![],
                 is_read_only: false,
+                aggregates: vec![],
             });
         }
         if sql_upper.starts_with("COMMIT") {
@@ -102,6 +128,7 @@ impl SqlAnalyzer {
                 tables: vec![],
                 shard_keys: vec![],
                 is_read_only: false,
+                aggregates: vec![],
             });
         }
         if sql_upper.starts_with("ROLLBACK") {
@@ -110,6 +137,7 @@ impl SqlAnalyzer {
                 tables: vec![],
                 shard_keys: vec![],
                 is_read_only: false,
+                aggregates: vec![],
             });
         }
 
@@ -189,6 +217,7 @@ impl SqlAnalyzer {
                     tables: vec![table],
                     shard_keys,
                     is_read_only: false,
+                    aggregates: vec![],
                 })
             }
             Statement::Update { table, selection, .. } => {
@@ -203,6 +232,7 @@ impl SqlAnalyzer {
                     tables: table_name.into_iter().collect(),
                     shard_keys,
                     is_read_only: false,
+                    aggregates: vec![],
                 })
             }
             Statement::Delete {
@@ -225,6 +255,7 @@ impl SqlAnalyzer {
                     tables,
                     shard_keys,
                     is_read_only: false,
+                    aggregates: vec![],
                 })
             }
             Statement::SetVariable { .. } => Ok(SqlAnalysis {
@@ -232,6 +263,7 @@ impl SqlAnalyzer {
                 tables: vec![],
                 shard_keys: vec![],
                 is_read_only: false,
+                aggregates: vec![],
             }),
             Statement::ShowTables { .. }
             | Statement::ShowColumns { .. } => Ok(SqlAnalysis {
@@ -239,18 +271,21 @@ impl SqlAnalyzer {
                 tables: vec![],
                 shard_keys: vec![],
                 is_read_only: true,
+                aggregates: vec![],
             }),
             Statement::Use { db_name } => Ok(SqlAnalysis {
                 stmt_type: StatementType::Use,
                 tables: vec![db_name.to_string()],
                 shard_keys: vec![],
                 is_read_only: false,
+                aggregates: vec![],
             }),
             _ => Ok(SqlAnalysis {
                 stmt_type: StatementType::Other,
                 tables: vec![],
                 shard_keys: vec![],
                 is_read_only: false,
+                aggregates: vec![],
             }),
         }
     }
@@ -258,6 +293,7 @@ impl SqlAnalyzer {
     fn analyze_query(&self, query: &Query) -> Result<SqlAnalysis, AnalyzerError> {
         let mut tables = vec![];
         let mut shard_keys = vec![];
+        let mut aggregates = vec![];
 
         if let SetExpr::Select(select) = query.body.as_ref() {
             // Extract table names from FROM clause
@@ -269,6 +305,9 @@ impl SqlAnalyzer {
             if let Some(selection) = &select.selection {
                 shard_keys = self.extract_shard_keys_from_expr(selection);
             }
+
+            // Extract aggregate functions from SELECT clause
+            aggregates = self.extract_aggregates(&select.projection);
         }
 
         Ok(SqlAnalysis {
@@ -276,7 +315,67 @@ impl SqlAnalyzer {
             tables,
             shard_keys,
             is_read_only: true,
+            aggregates,
         })
+    }
+
+    /// Extract aggregate functions from SELECT projection
+    fn extract_aggregates(&self, projection: &[SelectItem]) -> Vec<AggregateInfo> {
+        let mut aggregates = vec![];
+
+        for (position, item) in projection.iter().enumerate() {
+            match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    if let Some(agg) = self.extract_aggregate_from_expr(expr, position) {
+                        aggregates.push(agg);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        aggregates
+    }
+
+    /// Extract aggregate info from an expression
+    fn extract_aggregate_from_expr(&self, expr: &Expr, position: usize) -> Option<AggregateInfo> {
+        match expr {
+            Expr::Function(func) => self.extract_aggregate_from_function(func, position),
+            Expr::Nested(inner) => self.extract_aggregate_from_expr(inner, position),
+            _ => None,
+        }
+    }
+
+    /// Extract aggregate info from a function call
+    fn extract_aggregate_from_function(&self, func: &Function, position: usize) -> Option<AggregateInfo> {
+        let func_name = func.name.to_string().to_uppercase();
+        
+        let func_type = match func_name.as_str() {
+            "COUNT" => Some(AggregateType::Count),
+            "SUM" => Some(AggregateType::Sum),
+            "MAX" => Some(AggregateType::Max),
+            "MIN" => Some(AggregateType::Min),
+            "AVG" => Some(AggregateType::Avg),
+            _ => None,
+        }?;
+
+        // Check if it's COUNT(*)
+        let is_count_star = func_type == AggregateType::Count && self.is_count_star(func);
+
+        Some(AggregateInfo {
+            func_type,
+            position,
+            expr_str: format!("{}", func),
+            is_count_star,
+        })
+    }
+
+    /// Check if function is COUNT(*)
+    fn is_count_star(&self, func: &Function) -> bool {
+        if let Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) = func.args.first() {
+            return true;
+        }
+        false
     }
 
     fn extract_table_name_from_table_with_joins(
