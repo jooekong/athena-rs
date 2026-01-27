@@ -357,7 +357,8 @@ impl Session {
                 self.execute_with_transaction_ex(client, packet, single_eof).await?;
             } else {
                 // Use stateless connection from pool
-                self.execute_with_pooled_ex(client, packet, &shard_id, RouteTarget::Master, single_eof)
+                // For non-query commands, use session database (these go to home/default)
+                self.execute_with_pooled_ex(client, packet, &shard_id, RouteTarget::Master, single_eof, true)
                     .await?;
             }
 
@@ -544,8 +545,14 @@ impl Session {
             // Transaction connection is created with autocommit=0, no explicit BEGIN needed
             if self.state.transaction_shard.is_none() {
                 self.state.bind_transaction_shard(target_shard.0.clone());
+                // Use session database for home queries, shard's database for sharded queries
+                let tx_database = if route_result.is_home {
+                    self.state.database.clone()
+                } else {
+                    None
+                };
                 self.pool_manager
-                    .begin_transaction(self.id, target_shard, self.state.database.clone())
+                    .begin_transaction(self.id, target_shard, tx_database)
                     .await
                     .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
             } else {
@@ -567,7 +574,22 @@ impl Session {
                 }
             }
 
-            self.execute_with_transaction(client, original_packet.clone())
+            // Use rewritten SQL for transaction queries
+            let rewritten_sql = route_result
+                .rewritten_sqls
+                .get(target_shard)
+                .map(|s| s.as_str())
+                .unwrap_or(sql);
+
+            // Build new packet with rewritten SQL
+            let mut new_payload = vec![0x03]; // COM_QUERY
+            new_payload.extend(rewritten_sql.as_bytes());
+            let new_packet = Packet {
+                sequence_id: original_packet.sequence_id,
+                payload: new_payload.into(),
+            };
+
+            self.execute_with_transaction(client, new_packet)
                 .await?;
             return Ok(());
         }
@@ -632,7 +654,7 @@ impl Session {
                 payload: new_payload.into(),
             };
 
-            self.execute_with_pooled(client, new_packet, shard_id, route_result.target)
+            self.execute_with_pooled(client, new_packet, shard_id, route_result.target, route_result.is_home)
                 .await?;
             // permit is automatically released when dropped
 
@@ -738,6 +760,7 @@ impl Session {
 
         let mut first_shard = true;
         let mut column_count = 0u64;
+        let mut sequence_id: u8 = 1; // Response packets start at sequence 1
         let total_shards = route_result.shards.len();
 
         for (shard_idx, shard_id) in route_result.shards.iter().enumerate() {
@@ -774,9 +797,10 @@ impl Session {
             };
 
             // Get connection from pool
+            // Scatter queries are always for sharded tables, so don't use session database
             let mut conn = self
                 .pool_manager
-                .get_for_target(shard_id, route_result.target, self.state.database.clone())
+                .get_for_target(shard_id, route_result.target, None)
                 .await
                 .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
 
@@ -786,9 +810,9 @@ impl Session {
                 return Err(SessionError::BackendConnect(e.to_string()));
             }
 
-            // Read response
+            // Read response with sequence ID tracking
             let result = self
-                .forward_scatter_response(client, &mut conn, first_shard, is_last_shard, &mut column_count)
+                .forward_scatter_response(client, &mut conn, first_shard, is_last_shard, &mut column_count, &mut sequence_id)
                 .await;
 
             // Return connection to pool
@@ -823,6 +847,7 @@ impl Session {
     /// # Arguments
     /// * `send_columns` - Whether to send column definitions (true for first shard only)
     /// * `is_last_shard` - Whether this is the last shard (determines if EOF is sent)
+    /// * `sequence_id` - Current sequence ID tracker (mutable, incremented for each packet sent)
     async fn forward_scatter_response<C>(
         &self,
         client: &mut Framed<C, PacketCodec>,
@@ -830,6 +855,7 @@ impl Session {
         send_columns: bool,
         is_last_shard: bool,
         column_count: &mut u64,
+        sequence_id: &mut u8,
     ) -> Result<(), SessionError>
     where
         C: AsyncRead + AsyncWrite + Unpin,
@@ -842,7 +868,11 @@ impl Session {
 
         if is_err_packet(&first.payload) {
             // Error from backend - forward immediately and signal caller to abort
-            client.send(first).await?;
+            let err_packet = Packet {
+                sequence_id: *sequence_id,
+                payload: first.payload,
+            };
+            client.send(err_packet).await?;
             return Err(SessionError::Protocol("Scatter query failed on shard".into()));
         }
 
@@ -851,26 +881,44 @@ impl Session {
             // Only forward on last shard to avoid confusing client
             // TODO: accumulate affected_rows across shards
             if is_last_shard {
-                client.send(first).await?;
+                let ok_packet = Packet {
+                    sequence_id: *sequence_id,
+                    payload: first.payload,
+                };
+                *sequence_id = sequence_id.wrapping_add(1);
+                client.send(ok_packet).await?;
             }
             return Ok(());
         }
 
         // Result set - first packet is column count
+        // Always parse column count from this shard's response
+        let shard_column_count = parse_length_encoded_int(&first.payload).unwrap_or(0);
+        
         if send_columns {
-            // Parse column count for future shards
-            *column_count = parse_length_encoded_int(&first.payload).unwrap_or(0);
-            client.send(first).await?;
+            // Store column count for reference (though each shard should have same count)
+            *column_count = shard_column_count;
+            let col_count_packet = Packet {
+                sequence_id: *sequence_id,
+                payload: first.payload,
+            };
+            *sequence_id = sequence_id.wrapping_add(1);
+            client.send(col_count_packet).await?;
         }
 
-        // Read column definitions
-        for _ in 0..*column_count {
+        // Read column definitions (use this shard's column count)
+        for _ in 0..shard_column_count {
             let col_def = conn
                 .recv()
                 .await
                 .map_err(|_| SessionError::BackendDisconnected)?;
             if send_columns {
-                client.send(col_def).await?;
+                let col_packet = Packet {
+                    sequence_id: *sequence_id,
+                    payload: col_def.payload,
+                };
+                *sequence_id = sequence_id.wrapping_add(1);
+                client.send(col_packet).await?;
             }
         }
 
@@ -883,7 +931,12 @@ impl Session {
                 .await
                 .map_err(|_| SessionError::BackendDisconnected)?;
             if send_columns {
-                client.send(eof).await?;
+                let eof_packet = Packet {
+                    sequence_id: *sequence_id,
+                    payload: eof.payload,
+                };
+                *sequence_id = sequence_id.wrapping_add(1);
+                client.send(eof_packet).await?;
             }
         }
 
@@ -898,13 +951,23 @@ impl Session {
                 || is_err_packet(&packet.payload)
                 || is_eof_packet(&packet.payload, backend_caps);
 
-            // Always forward rows
+            // Always forward rows with correct sequence ID
             if !is_end {
-                client.send(packet).await?;
+                let row_packet = Packet {
+                    sequence_id: *sequence_id,
+                    payload: packet.payload,
+                };
+                *sequence_id = sequence_id.wrapping_add(1);
+                client.send(row_packet).await?;
             } else {
                 // Only forward final EOF from last shard
                 if is_last_shard {
-                    client.send(packet).await?;
+                    let eof_packet = Packet {
+                        sequence_id: *sequence_id,
+                        payload: packet.payload,
+                    };
+                    *sequence_id = sequence_id.wrapping_add(1);
+                    client.send(eof_packet).await?;
                 }
                 break;
             }
@@ -1041,16 +1104,18 @@ impl Session {
         packet: Packet,
         shard_id: &ShardId,
         target: RouteTarget,
+        is_home: bool,
     ) -> Result<(), SessionError>
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
-        self.execute_with_pooled_ex(client, packet, shard_id, target, false).await
+        self.execute_with_pooled_ex(client, packet, shard_id, target, false, is_home).await
     }
 
     /// Execute command using stateless pooled connection (extended version)
     /// 
     /// `single_eof` - if true, response has only one EOF (e.g., COM_FIELD_LIST)
+    /// `use_session_db` - if true, use session's database; if false, use shard's configured database
     async fn execute_with_pooled_ex<C>(
         &self,
         client: &mut Framed<C, PacketCodec>,
@@ -1058,14 +1123,23 @@ impl Session {
         shard_id: &ShardId,
         target: RouteTarget,
         single_eof: bool,
+        use_session_db: bool,
     ) -> Result<(), SessionError>
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
         // Get connection from pool based on target
+        // For sharded tables, use the shard's configured database (pass None)
+        // For non-sharded (home) tables, use the session's database
+        let database = if use_session_db {
+            self.state.database.clone()
+        } else {
+            None
+        };
+        
         let mut conn = self
             .pool_manager
-            .get_for_target(shard_id, target, self.state.database.clone())
+            .get_for_target(shard_id, target, database)
             .await
             .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
 

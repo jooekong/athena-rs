@@ -26,6 +26,8 @@ pub struct RouteResult {
     pub is_scatter: bool,
     /// Whether the shard intersection was empty (multiple sharded tables with no common shard)
     pub empty_intersection: bool,
+    /// Whether this query is routed to "home" db_group (for non-sharded tables)
+    pub is_home: bool,
 }
 
 /// SQL Router
@@ -92,22 +94,39 @@ impl Router {
         }
 
         // Determine if we have an empty intersection from sharded tables
-        let (shards, empty_intersection) = match &target_shards {
-            Some(s) if !s.is_empty() => (s.clone(), false),
+        let (shards, empty_intersection, use_home) = match &target_shards {
+            Some(s) if !s.is_empty() => (s.clone(), false, false),
             Some(_) => {
                 // Empty intersection: multiple sharded tables with no common shard
                 // Fall back to shard 0 but flag it
-                (vec![0], true)
+                (vec![0], true, false)
             }
             None => {
-                // No sharded tables - use default shard
-                (vec![0], false)
+                // No sharded tables - use "home" db_group if available
+                (vec![], false, true)
             }
         };
         let is_scatter = shards.len() > 1;
 
         // Generate rewritten SQL for each shard
         let mut rewritten_sqls = HashMap::new();
+        
+        // For non-sharded tables, use "home" db_group
+        if use_home {
+            let shard_id = ShardId("home".to_string());
+            // No table name rewriting for non-sharded tables
+            rewritten_sqls.insert(shard_id.clone(), sql.to_string());
+            
+            return RouteResult {
+                shards: vec![shard_id],
+                target,
+                rewritten_sqls,
+                is_scatter: false,
+                empty_intersection: false,
+                is_home: true,
+            };
+        }
+        
         for &shard_idx in &shards {
             let shard_id = ShardId(format!("shard_{}", shard_idx));
 
@@ -140,6 +159,7 @@ impl Router {
             rewritten_sqls,
             is_scatter,
             empty_intersection,
+            is_home: false,
         }
     }
 

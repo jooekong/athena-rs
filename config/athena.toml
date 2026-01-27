@@ -14,71 +14,99 @@ database = "athena_rs_test"
 
 # Circuit breaker / rate limiting configuration
 [circuit]
-# Enable/disable rate limiting
 enabled = true
-# Maximum concurrent requests per (user, shard) pair
 max_concurrent_per_user_shard = 10
-# Maximum queue size for waiting requests
 queue_size = 100
-# Timeout in milliseconds for waiting in queue
 queue_timeout_ms = 5000
 
 # =============================================================================
-# Groups Configuration (Multi-tenant mode)
+# Sharding Group Configuration
 # =============================================================================
 # 
-# Groups allow multi-tenant database access with:
-# - Group name = Client database name (clients connect with `-D group_name`)
-# - Independent proxy authentication (user/password separate from backend)
-# - USE DATABASE command is blocked (database switching not allowed)
+# 架构说明:
+# - home: 非分片表的默认数据库 (athena_rs_test)
+# - shard_0, shard_1: 分片数据库 0 (athena_shard_0) 的分表
+# - shard_2, shard_3: 分片数据库 1 (athena_shard_1) 的分表
 #
-# Example configuration:
-#
-# [[groups]]
-# name = "athena_rs_test"           # Client connects with: mysql -D athena_rs_test
-# user = "app_user"                  # Proxy authentication username
-# password = "proxy_secret"          # Proxy authentication password (NOT backend password)
-#
-# [[groups.db_groups]]
-# name = "default"
-#
-# [[groups.db_groups.instances]]
-# host = "10.78.81.148"
-# port = 3306
-# user = "rw_dbpaas"                 # Backend MySQL username
-# password = "GpoqEDWg80vO"          # Backend MySQL password
-# database = "athena_rs_test"        # Backend database name
-# role = "master"
-#
-# [groups.db_groups.instances.limiter]
-# enabled = true
-# max_concurrent = 100
-# max_queue_size = 50
-# queue_timeout_ms = 5000
+# 数据分布:
+# - athena_rs_test: users (非分片表)
+# - athena_shard_0: orders_0, orders_1
+# - athena_shard_1: orders_2, orders_3
 
-# Sharding rules (optional)
-# Each [[sharding]] block defines a sharding rule for a table
+[[groups]]
+name = "athena_rs_test"
+user = "app_user"
+password = "test123"
 
-# Example: shard 'users' table by 'user_id' using mod algorithm
-# [[sharding]]
-# name = "user_shard"
-# table_pattern = "users"
-# shard_column = "user_id"
-# algorithm = "mod"      # mod, hash, or range
-# shard_count = 4
+# Sharding rule: orders table sharded by user_id (string) using hash algorithm
+# 4 shards = 2 databases × 2 tables per database
+[[groups.sharding_rules]]
+name = "order_shard"
+table_pattern = "orders"
+shard_column = "user_id"
+algorithm = "hash"
+shard_count = 4
 
-# Example: shard 'orders' table by 'order_id' using hash algorithm
-# [[sharding]]
-# name = "order_shard"
-# table_pattern = "orders"
-# shard_column = "order_id"
-# algorithm = "hash"
-# shard_count = 8
+# =============================================================================
+# Home DB Group (for non-sharded tables)
+# =============================================================================
+[[groups.db_groups]]
+name = "home"
 
-# Example: shard 'logs' table by 'timestamp' using range algorithm
-# [[sharding]]
-# name = "log_shard"
-# table_pattern = "logs"
-# shard_column = "log_date"
-# algorithm = "range"
-# range_boundaries = [20230101, 20230401, 20230701, 20231001]
+[[groups.db_groups.instances]]
+host = "10.78.81.148"
+port = 3306
+user = "rw_dbpaas"
+password = "GpoqEDWg80vO"
+database = "athena_rs_test"
+role = "master"
+
+# =============================================================================
+# Shard DB 0: athena_shard_0 (orders_0, orders_1)
+# =============================================================================
+[[groups.db_groups]]
+name = "shard_0"
+
+[[groups.db_groups.instances]]
+host = "10.78.81.148"
+port = 3306
+user = "rw_dbpaas"
+password = "GpoqEDWg80vO"
+database = "athena_shard_0"
+role = "master"
+
+[[groups.db_groups]]
+name = "shard_1"
+
+[[groups.db_groups.instances]]
+host = "10.78.81.148"
+port = 3306
+user = "rw_dbpaas"
+password = "GpoqEDWg80vO"
+database = "athena_shard_0"
+role = "master"
+
+# =============================================================================
+# Shard DB 1: athena_shard_1 (orders_2, orders_3)
+# =============================================================================
+[[groups.db_groups]]
+name = "shard_2"
+
+[[groups.db_groups.instances]]
+host = "10.78.81.148"
+port = 3306
+user = "rw_dbpaas"
+password = "GpoqEDWg80vO"
+database = "athena_shard_1"
+role = "master"
+
+[[groups.db_groups]]
+name = "shard_3"
+
+[[groups.db_groups.instances]]
+host = "10.78.81.148"
+port = 3306
+user = "rw_dbpaas"
+password = "GpoqEDWg80vO"
+database = "athena_shard_1"
+role = "master"
