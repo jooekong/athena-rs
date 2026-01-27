@@ -260,13 +260,16 @@ impl Session {
                     .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
             }
 
+            // Check if command has single-EOF response (like COM_FIELD_LIST)
+            let single_eof = matches!(cmd, ClientCommand::FieldList { .. });
+
             // Execute command
             if use_transaction || self.state.in_transaction {
                 // Use transaction-bound connection
-                self.execute_with_transaction(client, packet).await?;
+                self.execute_with_transaction_ex(client, packet, single_eof).await?;
             } else {
                 // Use stateless connection from pool
-                self.execute_with_pooled(client, packet, &shard_id, RouteTarget::Master)
+                self.execute_with_pooled_ex(client, packet, &shard_id, RouteTarget::Master, single_eof)
                     .await?;
             }
 
@@ -766,7 +769,7 @@ impl Session {
         // Read EOF after columns (if not using deprecate EOF)
         // Use backend capabilities to determine EOF handling
         let backend_caps = conn.capabilities();
-        if !(backend_caps & capabilities::CLIENT_DEPRECATE_EOF != 0) {
+        if backend_caps & capabilities::CLIENT_DEPRECATE_EOF == 0 {
             let eof = conn
                 .recv()
                 .await
@@ -811,6 +814,21 @@ impl Session {
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
+        self.execute_with_transaction_ex(client, packet, false).await
+    }
+
+    /// Execute command using transaction-bound connection (extended version)
+    ///
+    /// `single_eof` - if true, response has only one EOF (e.g., COM_FIELD_LIST)
+    async fn execute_with_transaction_ex<C>(
+        &self,
+        client: &mut Framed<C, PacketCodec>,
+        packet: Packet,
+        single_eof: bool,
+    ) -> Result<(), SessionError>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
         let tx_pool = self.pool_manager.transaction_pool();
 
         // Send packet to backend
@@ -820,13 +838,27 @@ impl Session {
             .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
 
         // Forward response(s) back to client
-        self.forward_transaction_response(client).await
+        self.forward_transaction_response_ex(client, single_eof).await
     }
 
     /// Forward response from transaction connection to client
     async fn forward_transaction_response<C>(
         &self,
         client: &mut Framed<C, PacketCodec>,
+    ) -> Result<(), SessionError>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.forward_transaction_response_ex(client, false).await
+    }
+
+    /// Forward response from transaction connection to client (extended version)
+    ///
+    /// `single_eof` - if true, response has only one EOF (e.g., COM_FIELD_LIST)
+    async fn forward_transaction_response_ex<C>(
+        &self,
+        client: &mut Framed<C, PacketCodec>,
+        single_eof: bool,
     ) -> Result<(), SessionError>
     where
         C: AsyncRead + AsyncWrite + Unpin,
@@ -850,7 +882,7 @@ impl Session {
             return Ok(());
         }
 
-        // Result set - forward all packets
+        // Result set - forward all packets until first EOF
         client.send(first).await?;
 
         loop {
@@ -870,9 +902,9 @@ impl Session {
             }
         }
 
-        // In non-DEPRECATE_EOF mode, read rows (second loop for rows + final EOF)
-        // First loop above handled column definitions + first EOF
-        if backend_caps & capabilities::CLIENT_DEPRECATE_EOF == 0 {
+        // For single-EOF responses (like COM_FIELD_LIST), skip the second loop
+        // For normal result sets in non-DEPRECATE_EOF mode, read rows + final EOF
+        if !single_eof && backend_caps & capabilities::CLIENT_DEPRECATE_EOF == 0 {
             loop {
                 let packet = tx_pool
                     .recv(self.id)
@@ -905,6 +937,23 @@ impl Session {
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
+        self.execute_with_pooled_ex(client, packet, shard_id, target, false).await
+    }
+
+    /// Execute command using stateless pooled connection (extended version)
+    /// 
+    /// `single_eof` - if true, response has only one EOF (e.g., COM_FIELD_LIST)
+    async fn execute_with_pooled_ex<C>(
+        &self,
+        client: &mut Framed<C, PacketCodec>,
+        packet: Packet,
+        shard_id: &ShardId,
+        target: RouteTarget,
+        single_eof: bool,
+    ) -> Result<(), SessionError>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
         // Get connection from pool based on target
         let mut conn = self
             .pool_manager
@@ -919,7 +968,7 @@ impl Session {
         }
 
         // Forward response
-        let result = self.forward_pooled_response(client, &mut conn).await;
+        let result = self.forward_pooled_response_ex(client, &mut conn, single_eof).await;
 
         // Return connection to pool (if still usable)
         if conn.is_usable() {
@@ -936,6 +985,21 @@ impl Session {
         &self,
         client: &mut Framed<C, PacketCodec>,
         conn: &mut PooledConnection,
+    ) -> Result<(), SessionError>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.forward_pooled_response_ex(client, conn, false).await
+    }
+
+    /// Forward response from pooled connection to client (extended version)
+    /// 
+    /// `single_eof` - if true, response has only one EOF (e.g., COM_FIELD_LIST)
+    async fn forward_pooled_response_ex<C>(
+        &self,
+        client: &mut Framed<C, PacketCodec>,
+        conn: &mut PooledConnection,
+        single_eof: bool,
     ) -> Result<(), SessionError>
     where
         C: AsyncRead + AsyncWrite + Unpin,
@@ -974,9 +1038,9 @@ impl Session {
             }
         }
 
-        // In non-DEPRECATE_EOF mode, read rows (second loop for rows + final EOF)
-        // First loop above handled column definitions + first EOF
-        if backend_caps & capabilities::CLIENT_DEPRECATE_EOF == 0 {
+        // For single-EOF responses (like COM_FIELD_LIST), skip the second loop
+        // For normal result sets in non-DEPRECATE_EOF mode, read rows + final EOF
+        if !single_eof && backend_caps & capabilities::CLIENT_DEPRECATE_EOF == 0 {
             loop {
                 let packet = conn
                     .recv()

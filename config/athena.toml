@@ -5,11 +5,11 @@ listen_addr = "127.0.0.1"
 listen_port = 3307
 
 [backend]
-host = "127.0.0.1"
+host = "10.78.81.148"
 port = 3306
-user = "root"
-password = ""
-# database = "test"
+user = "rw_dbpaas"
+password = "GpoqEDWg80vO"
+database = "athena_rs_test"
 
 # Circuit breaker / rate limiting configuration
 [circuit]
