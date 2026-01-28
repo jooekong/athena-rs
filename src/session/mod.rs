@@ -9,7 +9,7 @@ use crate::parser::{
     AggregateInfo, AggregateMerger, AggregateValue, RowParser, SqlAnalysis, SqlAnalyzer,
     StatementType,
 };
-use crate::pool::{ConnectionError, PoolManager, PooledConnection, ShardId};
+use crate::pool::{ConnectionError, DbGroupId, PoolManager, PooledConnection};
 use crate::protocol::{
     capabilities, is_eof_packet, is_err_packet, is_ok_packet, ClientCommand, ErrPacket,
     HandshakeResponse, InitialHandshake, OkPacket, Packet, PacketCodec,
@@ -99,22 +99,12 @@ impl Session {
         group_manager: Arc<GroupManager>,
         concurrency_controller: Arc<ConcurrencyController>,
     ) -> Self {
-        // Use default group or create placeholder pool manager
-        let (pool_manager, router) = if let Some(default) = group_manager.default_group() {
-            (
-                default.pool_manager.clone(),
-                Router::new(default.router_config.clone()),
-            )
-        } else {
-            // Placeholder - will be replaced after handshake
-            (
-                Arc::new(PoolManager::new(
-                    crate::config::BackendConfig::default(),
-                    crate::pool::StatelessPoolConfig::default(),
-                )),
-                Router::default(),
-            )
-        };
+        // Placeholder pool manager - will be replaced after handshake when group is selected
+        let pool_manager = Arc::new(PoolManager::new(
+            crate::config::BackendConfig::default(),
+            crate::pool::StatelessPoolConfig::default(),
+        ));
+        let router = Router::default();
 
         Self {
             id,
@@ -232,14 +222,14 @@ impl Session {
 
         // Step 3: Validate connection by getting one from pool
         // This ensures we can connect to the backend before telling client OK
-        let shard_id = ShardId::default_shard();
+        let home = DbGroupId::Home;
         let test_conn = self
             .pool_manager
-            .get_master(&shard_id)
+            .get_master(&home)
             .await
             .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
         // Return connection immediately
-        self.pool_manager.put_master(&shard_id, test_conn).await;
+        self.pool_manager.put_master(&home, test_conn).await;
 
         // Step 4: Send OK to client (authentication successful)
         let ok = OkPacket::new();
@@ -258,8 +248,9 @@ impl Session {
 
         // Cleanup: release any bound transaction connection (abnormal exit)
         if self.state.in_transaction {
-            let shard_id = self.state.transaction_shard.as_ref().map(|s| ShardId(s.clone()));
-            self.pool_manager.end_transaction(self.id, shard_id.as_ref(), false).await;
+            self.pool_manager
+                .end_transaction(self.id, self.state.transaction_target.as_ref(), false)
+                .await;
         }
 
         result
@@ -336,8 +327,8 @@ impl Session {
                 continue;
             }
 
-            // Non-query commands go to default shard
-            let shard_id = ShardId::default_shard();
+            // Non-query commands go to home group
+            let home = DbGroupId::Home;
 
             // Determine if we need transaction connection or stateless connection
             let use_transaction = self.state.in_transaction || cmd.starts_transaction();
@@ -347,7 +338,7 @@ impl Session {
                 self.state.begin_transaction();
                 // Bind a connection for this transaction
                 self.pool_manager
-                    .begin_transaction(self.id, &shard_id, self.state.database.clone())
+                    .begin_transaction(self.id, &home, self.state.database.clone())
                     .await
                     .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
             }
@@ -361,16 +352,17 @@ impl Session {
                 self.execute_with_transaction_ex(client, packet, single_eof).await?;
             } else {
                 // Use stateless connection from pool
-                // For non-query commands, use session database (these go to home/default)
-                self.execute_with_pooled_ex(client, packet, &shard_id, RouteTarget::Master, single_eof, true)
+                self.execute_with_pooled_ex(client, packet, &home, RouteTarget::Master, single_eof)
                     .await?;
             }
 
             // Handle transaction end
             if cmd.ends_transaction() {
-                let shard_id = self.state.transaction_shard.as_ref().map(|s| ShardId(s.clone()));
+                let target = self.state.transaction_target.clone();
                 self.state.end_transaction();
-                self.pool_manager.end_transaction(self.id, shard_id.as_ref(), true).await;
+                self.pool_manager
+                    .end_transaction(self.id, target.as_ref(), true)
+                    .await;
             }
         }
     }
@@ -431,8 +423,8 @@ impl Session {
         if analysis.stmt_type == StatementType::Commit
             || analysis.stmt_type == StatementType::Rollback
         {
-            if self.state.transaction_shard.is_some() {
-                // Transaction was bound to a shard, forward COMMIT/ROLLBACK
+            if self.state.transaction_target.is_some() {
+                // Transaction was bound to a group, forward COMMIT/ROLLBACK
                 self.execute_with_transaction(client, original_packet.clone())
                     .await?;
             } else {
@@ -442,9 +434,11 @@ impl Session {
                     .send(ok.encode(1, self.state.capability_flags))
                     .await?;
             }
-            let shard_id = self.state.transaction_shard.as_ref().map(|s| ShardId(s.clone()));
+            let target = self.state.transaction_target.clone();
             self.state.end_transaction();
-            self.pool_manager.end_transaction(self.id, shard_id.as_ref(), true).await;
+            self.pool_manager
+                .end_transaction(self.id, target.as_ref(), true)
+                .await;
             return Ok(());
         }
 
@@ -503,9 +497,9 @@ impl Session {
 
         debug!(
             session_id = self.id,
-            shards = ?route_result.shards,
+            route_type = ?route_result.route_type,
             target = ?route_result.target,
-            is_scatter = route_result.is_scatter,
+            is_scatter = route_result.is_scatter(),
             route_time_us = route_elapsed.as_micros(),
             "Query routed"
         );
@@ -515,7 +509,7 @@ impl Session {
             RouteTarget::Master => "master",
             RouteTarget::Slave => "slave",
         };
-        metrics().record_route(target_str, route_result.is_scatter);
+        metrics().record_route(target_str, route_result.is_scatter());
 
         // Reject queries with empty shard intersection (conflicting shard keys in multi-table query)
         if route_result.empty_intersection {
@@ -533,7 +527,7 @@ impl Session {
         // If in transaction, handle deferred binding and shard consistency
         if self.state.in_transaction {
             // Scatter queries not allowed in transaction
-            if route_result.is_scatter {
+            if route_result.is_scatter() {
                 let err = ErrPacket::new(
                     1105, // ER_UNKNOWN_ERROR
                     "HY000",
@@ -545,32 +539,32 @@ impl Session {
                 return Ok(());
             }
 
-            let target_shard = &route_result.shards[0];
+            let target_group = route_result.target_group().unwrap();
 
-            // First query in transaction - bind to shard
+            // First query in transaction - bind to group
             // Transaction connection is created with autocommit=0, no explicit BEGIN needed
-            if self.state.transaction_shard.is_none() {
-                self.state.bind_transaction_shard(target_shard.0.clone());
+            if self.state.transaction_target.is_none() {
+                self.state.bind_transaction(target_group.clone());
                 // Use session database for home queries, shard's database for sharded queries
-                let tx_database = if route_result.is_home {
+                let tx_database = if route_result.is_home() {
                     self.state.database.clone()
                 } else {
                     None
                 };
                 self.pool_manager
-                    .begin_transaction(self.id, target_shard, tx_database)
+                    .begin_transaction(self.id, &target_group, tx_database)
                     .await
                     .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
             } else {
-                // Check shard consistency
-                let bound_shard = self.state.transaction_shard.as_ref().unwrap();
-                if bound_shard != &target_shard.0 {
+                // Check group consistency
+                let bound_target = self.state.transaction_target.as_ref().unwrap();
+                if bound_target != &target_group {
                     let err = ErrPacket::new(
                         1105,
                         "HY000",
                         &format!(
                             "Cross-shard query in transaction not allowed (bound to {}, query targets {})",
-                            bound_shard, target_shard.0
+                            bound_target, target_group
                         ),
                     );
                     client
@@ -581,11 +575,7 @@ impl Session {
             }
 
             // Use rewritten SQL for transaction queries
-            let rewritten_sql = route_result
-                .rewritten_sqls
-                .get(target_shard)
-                .map(|s| s.as_str())
-                .unwrap_or(sql);
+            let rewritten_sql = route_result.get_sql(0).unwrap_or(sql);
 
             // Build new packet with rewritten SQL
             let mut new_payload = vec![0x03]; // COM_QUERY
@@ -601,7 +591,7 @@ impl Session {
         }
 
         // For scatter queries (multiple shards), we need to execute on all and merge results
-        if route_result.is_scatter {
+        if route_result.is_scatter() {
             // Reject scatter writes - only SELECT is allowed for scatter queries
             if analysis.stmt_type.is_write() {
                 let err = ErrPacket::new(
@@ -620,36 +610,30 @@ impl Session {
             let scatter_elapsed = scatter_start.elapsed();
             info!(
                 session_id = self.id,
-                shard_count = route_result.shards.len(),
+                shard_count = route_result.shard_count(),
                 query_time_ms = query_start.elapsed().as_millis(),
                 scatter_time_ms = scatter_elapsed.as_millis(),
                 "Scatter query completed"
             );
         } else {
-            // Single shard execution
-            let shard_id = &route_result.shards[0];
+            // Single target execution
+            let target_group = route_result.target_group().unwrap();
+            let target_str = target_group.to_string();
 
             // Acquire rate limit permit
-            let _permit = match self.acquire_permit(&shard_id.0, client).await? {
+            let _permit = match self.acquire_permit(&target_str, client).await? {
                 AcquireResult::Acquired(permit) => Some(permit),
-                AcquireResult::Disabled => None, // Proceed without permit
-                AcquireResult::Rejected => {
-                    // Error already sent to client, skip this query
-                    return Ok(());
-                }
+                AcquireResult::Disabled => None,
+                AcquireResult::Rejected => return Ok(()),
             };
 
-            let rewritten_sql = route_result
-                .rewritten_sqls
-                .get(shard_id)
-                .map(|s| s.as_str())
-                .unwrap_or(sql);
+            let rewritten_sql = route_result.get_sql(0).unwrap_or(sql);
 
             debug!(
                 session_id = self.id,
-                shard = %shard_id.0,
+                target = %target_group,
                 sql = %rewritten_sql,
-                "Executing on single shard"
+                "Executing on single target"
             );
 
             // Build new packet with rewritten SQL
@@ -660,15 +644,14 @@ impl Session {
                 payload: new_payload.into(),
             };
 
-            self.execute_with_pooled(client, new_packet, shard_id, route_result.target, route_result.is_home)
+            self.execute_with_pooled(client, new_packet, &target_group, route_result.target)
                 .await?;
-            // permit is automatically released when dropped
 
             let query_elapsed = query_start.elapsed();
             info!(
                 session_id = self.id,
-                shard = %shard_id.0,
-                target = ?route_result.target,
+                target = %target_group,
+                route_target = ?route_result.target,
                 query_time_ms = query_elapsed.as_millis(),
                 parse_time_us = parse_elapsed.as_micros(),
                 route_time_us = route_elapsed.as_micros(),
@@ -683,7 +666,7 @@ impl Session {
                 StatementType::Delete => "delete",
                 _ => "other",
             };
-            metrics().record_query(query_type, &shard_id.0, query_elapsed.as_secs_f64());
+            metrics().record_query(query_type, &target_str, query_elapsed.as_secs_f64());
         }
 
         Ok(())
@@ -797,24 +780,26 @@ impl Session {
         let mut first_shard = true;
 
         // Collect data from all shards
-        for shard_id in &route_result.shards {
+        let target_groups = route_result.route_type.to_group_ids();
+        for (idx, group_id) in target_groups.iter().enumerate() {
+            let group_str = group_id.to_string();
+            
             // Acquire rate limit permit
-            let _permit = match self.acquire_permit(&shard_id.0, client).await? {
+            let _permit = match self.acquire_permit(&group_str, client).await? {
                 AcquireResult::Acquired(permit) => Some(permit),
                 AcquireResult::Disabled => None,
                 AcquireResult::Rejected => return Ok(()),
             };
 
             let rewritten_sql = route_result
-                .rewritten_sqls
-                .get(shard_id)
+                .get_sql(idx)
                 .ok_or_else(|| SessionError::Protocol("Missing rewritten SQL".into()))?;
 
             debug!(
                 session_id = self.id,
-                shard = %shard_id.0,
+                target = %group_id,
                 sql = %rewritten_sql,
-                "Executing aggregate scatter on shard"
+                "Executing aggregate scatter"
             );
 
             // Build and send query
@@ -827,7 +812,7 @@ impl Session {
 
             let mut conn = self
                 .pool_manager
-                .get_for_target(shard_id, route_result.target)
+                .get_for_target(group_id, route_result.target)
                 .await
                 .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
 
@@ -850,23 +835,20 @@ impl Session {
             // Return connection to pool
             if conn.is_usable() {
                 self.pool_manager
-                    .put_for_target(shard_id, route_result.target, conn)
+                    .put_for_target(group_id, route_result.target, conn)
                     .await;
             }
 
             if let Err(e) = result {
                 warn!(
                     session_id = self.id,
-                    shard = %shard_id.0,
+                    target = %group_id,
                     error = %e,
-                    "Aggregate scatter failed on shard"
+                    "Aggregate scatter failed"
                 );
-                // Record error in metrics for observability
                 metrics().record_query_error("scatter_shard_error");
-                // Send error to client
                 let err = ErrPacket::new(1105, "HY000", &format!("Shard error: {}", e));
                 client.send(err.encode(1, self.state.capability_flags)).await?;
-                // Return Ok to keep session alive (error already sent to client)
                 return Ok(());
             }
 
@@ -1114,32 +1096,30 @@ impl Session {
     {
         let mut first_shard = true;
         let mut column_count = 0u64;
-        let mut sequence_id: u8 = 1; // Response packets start at sequence 1
-        let total_shards = route_result.shards.len();
+        let mut sequence_id: u8 = 1;
+        let target_groups = route_result.route_type.to_group_ids();
+        let total_shards = target_groups.len();
 
-        for (shard_idx, shard_id) in route_result.shards.iter().enumerate() {
-            let is_last_shard = shard_idx == total_shards - 1;
-            // Acquire rate limit permit for this shard
-            let _permit = match self.acquire_permit(&shard_id.0, client).await? {
+        for (idx, group_id) in target_groups.iter().enumerate() {
+            let is_last_shard = idx == total_shards - 1;
+            let group_str = group_id.to_string();
+            
+            // Acquire rate limit permit
+            let _permit = match self.acquire_permit(&group_str, client).await? {
                 AcquireResult::Acquired(permit) => Some(permit),
                 AcquireResult::Disabled => None,
-                AcquireResult::Rejected => {
-                    // Error already sent to client
-                    // For scatter queries, we abort the whole operation
-                    return Ok(());
-                }
+                AcquireResult::Rejected => return Ok(()),
             };
 
             let rewritten_sql = route_result
-                .rewritten_sqls
-                .get(shard_id)
+                .get_sql(idx)
                 .ok_or_else(|| SessionError::Protocol("Missing rewritten SQL".into()))?;
 
             debug!(
                 session_id = self.id,
-                shard = %shard_id.0,
+                target = %group_id,
                 sql = %rewritten_sql,
-                "Executing scatter on shard"
+                "Executing scatter"
             );
 
             // Build query packet
@@ -1151,10 +1131,9 @@ impl Session {
             };
 
             // Get connection from pool
-            // Scatter queries are always for sharded tables, so don't use session database
             let mut conn = self
                 .pool_manager
-                .get_for_target(shard_id, route_result.target)
+                .get_for_target(group_id, route_result.target)
                 .await
                 .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
 
@@ -1172,30 +1151,25 @@ impl Session {
             // Return connection to pool
             if conn.is_usable() {
                 self.pool_manager
-                    .put_for_target(shard_id, route_result.target, conn)
+                    .put_for_target(group_id, route_result.target, conn)
                     .await;
             }
 
-            // If error occurred (already sent to client), abort remaining shards
+            // If error occurred, abort remaining shards
             if let Err(e) = result {
                 warn!(
                     session_id = self.id,
-                    shard = %shard_id.0,
+                    target = %group_id,
                     error = %e,
-                    "Scatter query aborted due to shard error"
+                    "Scatter query aborted due to error"
                 );
-                // Record error in metrics for observability
                 metrics().record_query_error("scatter_shard_error");
-                // Return Ok to keep session alive (error already sent to client)
                 return Ok(());
             }
 
-            // permit is automatically released when it goes out of scope
             first_shard = false;
         }
 
-        // Send final EOF if we haven't sent one
-        // For now, the last shard's EOF will be the final one
         Ok(())
     }
 
@@ -1459,37 +1433,31 @@ impl Session {
         &self,
         client: &mut Framed<C, PacketCodec>,
         packet: Packet,
-        shard_id: &ShardId,
+        group_id: &DbGroupId,
         target: RouteTarget,
-        is_home: bool,
     ) -> Result<(), SessionError>
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
-        self.execute_with_pooled_ex(client, packet, shard_id, target, false, is_home).await
+        self.execute_with_pooled_ex(client, packet, group_id, target, false).await
     }
 
     /// Execute command using stateless pooled connection (extended version)
-    /// 
-    /// `single_eof` - if true, response has only one EOF (e.g., COM_FIELD_LIST)
-    /// `_use_session_db` - deprecated, kept for API compatibility
     async fn execute_with_pooled_ex<C>(
         &self,
         client: &mut Framed<C, PacketCodec>,
         packet: Packet,
-        shard_id: &ShardId,
+        group_id: &DbGroupId,
         target: RouteTarget,
         single_eof: bool,
-        _use_session_db: bool,
     ) -> Result<(), SessionError>
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
-        // Get connection from pool based on target
-        // Each pool is defined by endpoint:port/database+user, no database switching needed
+        // Get connection from pool
         let mut conn = self
             .pool_manager
-            .get_for_target(shard_id, target)
+            .get_for_target(group_id, target)
             .await
             .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
 
@@ -1505,7 +1473,7 @@ impl Session {
         // Return connection to pool (if still usable)
         if conn.is_usable() {
             self.pool_manager
-                .put_for_target(shard_id, target, conn)
+                .put_for_target(group_id, target, conn)
                 .await;
         }
 
@@ -1605,35 +1573,42 @@ impl Session {
     /// Returns (variable_name, value) or None if parsing fails
     fn parse_set_statement(&self, sql: &str) -> Option<(String, String)> {
         let sql = sql.trim();
-        let upper = sql.to_uppercase();
+
+        // Helper for case-insensitive prefix matching (avoids to_uppercase allocation)
+        fn starts_with_ignore_case(s: &str, prefix: &str) -> bool {
+            s.len() >= prefix.len()
+                && s.as_bytes()[..prefix.len()]
+                    .iter()
+                    .zip(prefix.as_bytes())
+                    .all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
+        }
 
         // Must start with SET
-        if !upper.starts_with("SET ") {
+        if !starts_with_ignore_case(sql, "SET ") {
             return None;
         }
 
         // Handle SET NAMES/CHARSET specially
-        if upper.starts_with("SET NAMES") {
+        if starts_with_ignore_case(sql, "SET NAMES") {
             let value = sql[9..].trim().trim_matches(|c| c == '\'' || c == '"');
             return Some(("names".to_string(), value.to_string()));
         }
-        if upper.starts_with("SET CHARSET") || upper.starts_with("SET CHARACTER SET") {
-            let offset = if upper.starts_with("SET CHARACTER SET") {
-                17
-            } else {
-                11
-            };
-            let value = sql[offset..].trim().trim_matches(|c| c == '\'' || c == '"');
+        if starts_with_ignore_case(sql, "SET CHARACTER SET") {
+            let value = sql[17..].trim().trim_matches(|c| c == '\'' || c == '"');
+            return Some(("charset".to_string(), value.to_string()));
+        }
+        if starts_with_ignore_case(sql, "SET CHARSET") {
+            let value = sql[11..].trim().trim_matches(|c| c == '\'' || c == '"');
             return Some(("charset".to_string(), value.to_string()));
         }
 
         // Skip "SET " prefix (4 chars)
         let rest = sql[4..].trim();
 
-        // Handle @@session.var or @@var
-        let rest = if rest.starts_with("@@session.") {
+        // Handle @@session.var or @@var (case-insensitive for prefix)
+        let rest = if starts_with_ignore_case(rest, "@@session.") {
             &rest[10..]
-        } else if rest.starts_with("@@global.") {
+        } else if starts_with_ignore_case(rest, "@@global.") {
             &rest[9..]
         } else if rest.starts_with("@@") {
             &rest[2..]

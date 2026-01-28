@@ -4,15 +4,7 @@
 listen_addr = "127.0.0.1"
 listen_port = 3307
 
-# Default backend (used when no groups are configured - legacy mode)
-[backend]
-host = "10.78.81.148"
-port = 3306
-user = "rw_dbpaas"
-password = "GpoqEDWg80vO"
-database = "athena_rs_test"
-
-# Circuit breaker / rate limiting configuration
+# Circuit breaker / rate limiting configuration (deprecated, use per-instance limiter)
 [circuit]
 enabled = true
 max_concurrent_per_user_shard = 10

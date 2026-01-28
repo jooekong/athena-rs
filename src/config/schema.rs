@@ -5,17 +5,15 @@ use crate::router::ShardingRule;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
-    /// Default backend (used when no group is configured)
-    pub backend: BackendConfig,
-    /// Groups configuration (multi-tenant support)
-    #[serde(default)]
+    /// Groups configuration (required, at least one group must be defined)
     pub groups: Vec<GroupConfig>,
-    /// Legacy circuit config (deprecated, use group-level config instead)
-    #[serde(default)]
-    pub circuit: CircuitConfig,
     /// Health check configuration
     #[serde(default)]
     pub health: HealthCheckConfig,
+    /// Legacy circuit config (deprecated)
+    #[serde(default)]
+    pub circuit: CircuitConfig,
+    /// Legacy sharding rules (deprecated, use group-level sharding_rules instead)
     #[serde(default)]
     pub sharding: Vec<ShardingRule>,
 }
@@ -267,14 +265,24 @@ impl Default for Config {
                 listen_addr: "127.0.0.1".to_string(),
                 listen_port: 3307,
             },
-            backend: BackendConfig {
-                host: "127.0.0.1".to_string(),
-                port: 3306,
+            groups: vec![GroupConfig {
+                name: "default".to_string(),
                 user: "root".to_string(),
                 password: String::new(),
-                database: None,
-            },
-            groups: Vec::new(),
+                db_groups: vec![DBGroupConfig {
+                    name: "shard_0".to_string(),
+                    instances: vec![DBInstanceConfig {
+                        host: "127.0.0.1".to_string(),
+                        port: 3306,
+                        user: "root".to_string(),
+                        password: String::new(),
+                        database: None,
+                        role: DBInstanceRole::Master,
+                        limiter: LimiterConfig::default(),
+                    }],
+                }],
+                sharding_rules: Vec::new(),
+            }],
             circuit: CircuitConfig::default(),
             health: HealthCheckConfig::default(),
             sharding: Vec::new(),
@@ -359,19 +367,29 @@ mod tests {
 [server]
 listen_addr = "0.0.0.0"
 
-[backend]
-host = "mysql.local"
-port = 3306
+[[groups]]
+name = "default"
 user = "app"
 password = "secret"
+
+[[groups.db_groups]]
+name = "shard_0"
+
+[[groups.db_groups.instances]]
+host = "mysql.local"
+port = 3306
+user = "root"
+password = "secret"
+role = "master"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.listen_addr, "0.0.0.0");
         assert_eq!(config.server.listen_port, 3307); // default
-        assert_eq!(config.backend.host, "mysql.local");
+        assert_eq!(config.groups.len(), 1);
+        assert_eq!(config.groups[0].name, "default");
+        assert_eq!(config.groups[0].db_groups[0].instances[0].host, "mysql.local");
         assert!(config.circuit.enabled); // default
         assert!(config.sharding.is_empty());
-        assert!(config.groups.is_empty());
     }
 
     #[test]
@@ -379,12 +397,6 @@ password = "secret"
         let toml = r#"
 [server]
 listen_addr = "127.0.0.1"
-
-[backend]
-host = "localhost"
-port = 3306
-user = "root"
-password = ""
 
 [[groups]]
 name = "tenant_a"
@@ -443,11 +455,20 @@ max_concurrent = 200
 listen_addr = "127.0.0.1"
 listen_port = 3307
 
-[backend]
+[[groups]]
+name = "default"
+user = "root"
+password = ""
+
+[[groups.db_groups]]
+name = "shard_0"
+
+[[groups.db_groups.instances]]
 host = "localhost"
 port = 3306
 user = "root"
 password = ""
+role = "master"
 
 [[sharding]]
 name = "user_shard"
@@ -480,11 +501,20 @@ shard_count = 8
 [server]
 listen_addr = "127.0.0.1"
 
-[backend]
+[[groups]]
+name = "default"
+user = "root"
+password = ""
+
+[[groups.db_groups]]
+name = "shard_0"
+
+[[groups.db_groups.instances]]
 host = "localhost"
 port = 3306
 user = "root"
 password = ""
+role = "master"
 
 [circuit]
 enabled = false
@@ -522,10 +552,11 @@ queue_timeout_ms = 3000
         let config = Config::default();
         assert_eq!(config.server.listen_addr, "127.0.0.1");
         assert_eq!(config.server.listen_port, 3307);
-        assert_eq!(config.backend.host, "127.0.0.1");
-        assert_eq!(config.backend.port, 3306);
+        assert_eq!(config.groups.len(), 1);
+        assert_eq!(config.groups[0].name, "default");
+        assert_eq!(config.groups[0].db_groups[0].instances[0].host, "127.0.0.1");
+        assert_eq!(config.groups[0].db_groups[0].instances[0].port, 3306);
         assert!(config.sharding.is_empty());
-        assert!(config.groups.is_empty());
     }
 
     #[test]
@@ -629,11 +660,20 @@ queue_timeout_ms = 3000
 [server]
 listen_addr = "127.0.0.1"
 
-[backend]
+[[groups]]
+name = "default"
+user = "root"
+password = ""
+
+[[groups.db_groups]]
+name = "shard_0"
+
+[[groups.db_groups.instances]]
 host = "localhost"
 port = 3306
 user = "root"
 password = ""
+role = "master"
 
 [health]
 enabled = true

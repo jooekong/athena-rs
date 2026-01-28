@@ -159,24 +159,24 @@ impl ReadWriteRouter {
     ) -> Option<&'a DBInstanceConfig> {
         match target {
             RouteTarget::Master => {
-                let masters = db_group.masters();
-                let healthy: Vec<_> = masters
+                let healthy: Vec<_> = db_group
+                    .masters()
                     .into_iter()
                     .filter(|m| registry.is_available(&m.addr()))
                     .collect();
                 self.master_selector.select(&healthy)
             }
             RouteTarget::Slave => {
-                let slaves = db_group.slaves();
-                let healthy_slaves: Vec<_> = slaves
+                let healthy_slaves: Vec<_> = db_group
+                    .slaves()
                     .into_iter()
                     .filter(|s| registry.is_available(&s.addr()))
                     .collect();
 
                 if healthy_slaves.is_empty() {
                     // Fallback to healthy master
-                    let masters = db_group.masters();
-                    let healthy_masters: Vec<_> = masters
+                    let healthy_masters: Vec<_> = db_group
+                        .masters()
                         .into_iter()
                         .filter(|m| registry.is_available(&m.addr()))
                         .collect();
@@ -197,8 +197,8 @@ impl ReadWriteRouter {
     ) -> Option<(&'a DBInstanceConfig, RouteTarget)> {
         match target {
             RouteTarget::Master => {
-                let masters = db_group.masters();
-                let healthy: Vec<_> = masters
+                let healthy: Vec<_> = db_group
+                    .masters()
                     .into_iter()
                     .filter(|m| registry.is_available(&m.addr()))
                     .collect();
@@ -207,16 +207,15 @@ impl ReadWriteRouter {
                     .map(|i| (i, RouteTarget::Master))
             }
             RouteTarget::Slave => {
-                let slaves = db_group.slaves();
-                let healthy_slaves: Vec<_> = slaves
+                let healthy_slaves: Vec<_> = db_group
+                    .slaves()
                     .into_iter()
                     .filter(|s| registry.is_available(&s.addr()))
                     .collect();
 
                 if healthy_slaves.is_empty() {
-                    // Fallback to healthy master
-                    let masters = db_group.masters();
-                    let healthy_masters: Vec<_> = masters
+                    let healthy_masters: Vec<_> = db_group
+                        .masters()
                         .into_iter()
                         .filter(|m| registry.is_available(&m.addr()))
                         .collect();

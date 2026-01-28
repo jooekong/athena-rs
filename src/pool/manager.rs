@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -11,16 +12,70 @@ use super::connection::{ConnectionError, PooledConnection};
 use super::stateless::{StatelessPool, StatelessPoolConfig};
 use super::transaction::TransactionPool;
 
-/// A group of slave pools with its own round-robin counter
+/// Index of a shard in the shard pool vector (0-based)
+pub type ShardIndex = usize;
+
+/// Database group identifier for routing
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DbGroupId {
+    /// Shard by index (0, 1, 2, ...)
+    Shard(ShardIndex),
+    /// Home group for non-sharded tables
+    Home,
+}
+
+impl DbGroupId {
+    pub fn shard(index: ShardIndex) -> Self {
+        DbGroupId::Shard(index)
+    }
+
+    pub fn home() -> Self {
+        DbGroupId::Home
+    }
+
+    pub fn is_shard(&self) -> bool {
+        matches!(self, DbGroupId::Shard(_))
+    }
+
+    pub fn is_home(&self) -> bool {
+        matches!(self, DbGroupId::Home)
+    }
+
+    pub fn shard_index(&self) -> Option<ShardIndex> {
+        match self {
+            DbGroupId::Shard(idx) => Some(*idx),
+            DbGroupId::Home => None,
+        }
+    }
+}
+
+impl fmt::Display for DbGroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DbGroupId::Shard(idx) => write!(f, "shard_{}", idx),
+            DbGroupId::Home => write!(f, "home"),
+        }
+    }
+}
+
+/// A group of slave pools with round-robin selection
 struct SlavePoolGroup {
     pools: Vec<Arc<StatelessPool>>,
+    /// Address to pool index for O(1) lookup when returning connections
+    addr_to_index: HashMap<String, usize>,
     counter: AtomicUsize,
 }
 
 impl SlavePoolGroup {
     fn new(pools: Vec<Arc<StatelessPool>>) -> Self {
+        let addr_to_index: HashMap<String, usize> = pools
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.backend_addr().to_string(), i))
+            .collect();
         Self {
             pools,
+            addr_to_index,
             counter: AtomicUsize::new(0),
         }
     }
@@ -34,261 +89,299 @@ impl SlavePoolGroup {
     }
 
     fn find_by_addr(&self, addr: &str) -> Option<Arc<StatelessPool>> {
-        self.pools.iter().find(|p| p.backend_addr() == addr).cloned()
+        self.addr_to_index
+            .get(addr)
+            .and_then(|&idx| self.pools.get(idx))
+            .cloned()
     }
 }
 
-/// Identifier for a shard/backend
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ShardId(pub String);
-
-impl ShardId {
-    pub fn default_shard() -> Self {
-        Self("default".to_string())
-    }
-}
-
-/// Configuration for a shard backend
+/// Backend configuration for a database group
 #[derive(Debug, Clone)]
-pub struct ShardBackend {
-    /// Shard identifier
-    pub shard_id: ShardId,
-    /// Master backend configuration
+pub struct DbGroupBackend {
     pub master: BackendConfig,
-    /// Slave backend configurations (for read replicas)
     pub slaves: Vec<BackendConfig>,
 }
 
-/// Pool manager that manages connection pools for multiple shards
+/// Pool manager using Vec-based storage for O(1) index access
 pub struct PoolManager {
-    /// Stateless pools per shard (for master)
-    stateless_pools: RwLock<HashMap<ShardId, Arc<StatelessPool>>>,
-    /// Stateless pools for slaves per shard (each shard has its own round-robin counter)
-    slave_pools: RwLock<HashMap<ShardId, SlavePoolGroup>>,
-    /// Transaction pool (shared, connections are bound to sessions)
+    /// Shard master pools (indexed by ShardIndex)
+    shard_master_pools: RwLock<Vec<Arc<StatelessPool>>>,
+    /// Shard slave pool groups (indexed by ShardIndex)
+    shard_slave_pools: RwLock<Vec<Option<SlavePoolGroup>>>,
+    /// Shard backend configs (indexed by ShardIndex)
+    shard_backends: RwLock<Vec<DbGroupBackend>>,
+
+    /// Home group master pool (for non-sharded tables)
+    home_master_pool: RwLock<Option<Arc<StatelessPool>>>,
+    /// Home group slave pool
+    home_slave_pool: RwLock<Option<SlavePoolGroup>>,
+    /// Home group backend config
+    home_backend: RwLock<Option<DbGroupBackend>>,
+
+    /// Transaction pool (connections bound to sessions)
     transaction_pool: Arc<TransactionPool>,
-    /// Backend configurations per shard
-    backends: RwLock<HashMap<ShardId, ShardBackend>>,
     /// Pool configuration
     pool_config: StatelessPoolConfig,
 }
 
 impl PoolManager {
-    /// Create a new pool manager with a single default backend
+    /// Create a new pool manager with a default backend as home
     pub fn new(backend_config: BackendConfig, pool_config: StatelessPoolConfig) -> Self {
-        let backend_config = Arc::new(backend_config);
+        let backend_config_arc = Arc::new(backend_config.clone());
         let transaction_pool = Arc::new(TransactionPool::new());
 
-        let mut stateless_pools = HashMap::new();
         let default_pool = Arc::new(StatelessPool::new(
-            backend_config.clone(),
+            backend_config_arc,
             pool_config.clone(),
             None,
         ));
-        stateless_pools.insert(ShardId::default_shard(), default_pool);
 
-        let mut backends = HashMap::new();
-        backends.insert(
-            ShardId::default_shard(),
-            ShardBackend {
-                shard_id: ShardId::default_shard(),
-                master: (*backend_config).clone(),
-                slaves: vec![],
-            },
-        );
+        let home_backend = DbGroupBackend {
+            master: backend_config,
+            slaves: vec![],
+        };
 
         Self {
-            stateless_pools: RwLock::new(stateless_pools),
-            slave_pools: RwLock::new(HashMap::new()),
+            shard_master_pools: RwLock::new(Vec::new()),
+            shard_slave_pools: RwLock::new(Vec::new()),
+            shard_backends: RwLock::new(Vec::new()),
+            home_master_pool: RwLock::new(Some(default_pool)),
+            home_slave_pool: RwLock::new(None),
+            home_backend: RwLock::new(Some(home_backend)),
             transaction_pool,
-            backends: RwLock::new(backends),
             pool_config,
         }
     }
 
-    /// Add a shard backend
-    pub async fn add_shard(&self, backend: ShardBackend) {
-        let shard_id = backend.shard_id.clone();
+    /// Add a shard at a specific index
+    pub async fn add_shard(&self, index: ShardIndex, backend: DbGroupBackend) {
         let master_config = Arc::new(backend.master.clone());
 
-        // Create master pool
         let master_pool = Arc::new(StatelessPool::new(
-            master_config.clone(),
+            master_config,
             self.pool_config.clone(),
             None,
         ));
 
-        // Create slave pools
         let slave_pools: Vec<Arc<StatelessPool>> = backend
             .slaves
             .iter()
-            .map(|slave_config| {
-                Arc::new(StatelessPool::new(
-                    Arc::new(slave_config.clone()),
-                    self.pool_config.clone(),
-                    None,
-                ))
-            })
+            .map(|cfg| Arc::new(StatelessPool::new(Arc::new(cfg.clone()), self.pool_config.clone(), None)))
             .collect();
 
-        {
-            let mut pools = self.stateless_pools.write().await;
-            pools.insert(shard_id.clone(), master_pool);
-        }
-
-        if !slave_pools.is_empty() {
-            let mut slaves = self.slave_pools.write().await;
-            slaves.insert(shard_id.clone(), SlavePoolGroup::new(slave_pools));
-        }
-
-        {
-            let mut backends = self.backends.write().await;
-            backends.insert(shard_id.clone(), backend);
-        }
-
-        debug!(shard_id = ?shard_id, "Added shard backend");
-    }
-
-    /// Get a connection from the master pool for a shard
-    ///
-    /// Note: No database switching is performed. Each pool is defined by
-    /// endpoint:port/database+user, and USE DATABASE is not supported.
-    pub async fn get_master(&self, shard_id: &ShardId) -> Result<PooledConnection, ConnectionError> {
-        let pools = self.stateless_pools.read().await;
-        let pool = if let Some(pool) = pools.get(shard_id) {
-            pool.clone()
+        let slave_group = if slave_pools.is_empty() {
+            None
         } else {
-            // Fall back to default if shard not found
-            pools
-                .get(&ShardId::default_shard())
-                .ok_or(ConnectionError::Disconnected)?
-                .clone()
+            Some(SlavePoolGroup::new(slave_pools))
         };
-        drop(pools); // Release lock before async operation
 
-        pool.get().await
+        // Extend vectors if needed
+        {
+            let mut masters = self.shard_master_pools.write().await;
+            while masters.len() <= index {
+                masters.push(Arc::new(StatelessPool::new(
+                    Arc::new(BackendConfig::default()),
+                    self.pool_config.clone(),
+                    None,
+                )));
+            }
+            masters[index] = master_pool;
+        }
+
+        {
+            let mut slaves = self.shard_slave_pools.write().await;
+            while slaves.len() <= index {
+                slaves.push(None);
+            }
+            slaves[index] = slave_group;
+        }
+
+        {
+            let mut backends = self.shard_backends.write().await;
+            while backends.len() <= index {
+                backends.push(DbGroupBackend {
+                    master: BackendConfig::default(),
+                    slaves: vec![],
+                });
+            }
+            backends[index] = backend;
+        }
+
+        debug!(index, "Added shard");
     }
 
-    /// Get a connection from a slave pool for a shard (round-robin)
-    ///
-    /// Each shard has its own round-robin counter for even distribution.
-    /// Falls back to master if no slaves available.
-    pub async fn get_slave(&self, shard_id: &ShardId) -> Result<PooledConnection, ConnectionError> {
-        let slaves = self.slave_pools.read().await;
-        if let Some(slave_group) = slaves.get(shard_id) {
-            if let Some(pool) = slave_group.select() {
-                drop(slaves); // Release lock before async operation
-                return pool.get().await;
+    /// Set the home group backend
+    pub async fn set_home(&self, backend: DbGroupBackend) {
+        let master_config = Arc::new(backend.master.clone());
+
+        let master_pool = Arc::new(StatelessPool::new(
+            master_config,
+            self.pool_config.clone(),
+            None,
+        ));
+
+        let slave_group = if backend.slaves.is_empty() {
+            None
+        } else {
+            let pools: Vec<Arc<StatelessPool>> = backend
+                .slaves
+                .iter()
+                .map(|cfg| Arc::new(StatelessPool::new(Arc::new(cfg.clone()), self.pool_config.clone(), None)))
+                .collect();
+            Some(SlavePoolGroup::new(pools))
+        };
+
+        *self.home_master_pool.write().await = Some(master_pool);
+        *self.home_slave_pool.write().await = slave_group;
+        *self.home_backend.write().await = Some(backend);
+
+        debug!("Set home group");
+    }
+
+    /// Get a master connection
+    pub async fn get_master(&self, group_id: &DbGroupId) -> Result<PooledConnection, ConnectionError> {
+        let pool = match group_id {
+            DbGroupId::Shard(index) => {
+                let pools = self.shard_master_pools.read().await;
+                pools.get(*index).cloned().or_else(|| None)
+            }
+            DbGroupId::Home => self.home_master_pool.read().await.clone(),
+        };
+
+        // Fallback to home if shard not found
+        let pool = pool.or_else(|| {
+            // Can't await here, so we return None and handle below
+            None
+        });
+
+        let pool = if pool.is_none() && matches!(group_id, DbGroupId::Shard(_)) {
+            self.home_master_pool.read().await.clone()
+        } else {
+            pool
+        };
+
+        pool.ok_or(ConnectionError::Disconnected)?.get().await
+    }
+
+    /// Get a slave connection (round-robin, falls back to master)
+    pub async fn get_slave(&self, group_id: &DbGroupId) -> Result<PooledConnection, ConnectionError> {
+        let pool = match group_id {
+            DbGroupId::Shard(index) => {
+                let slaves = self.shard_slave_pools.read().await;
+                slaves.get(*index).and_then(|g| g.as_ref()).and_then(|g| g.select())
+            }
+            DbGroupId::Home => {
+                let slave_group = self.home_slave_pool.read().await;
+                slave_group.as_ref().and_then(|g| g.select())
+            }
+        };
+
+        if let Some(pool) = pool {
+            pool.get().await
+        } else {
+            self.get_master(group_id).await
+        }
+    }
+
+    /// Return a master connection
+    pub async fn put_master(&self, group_id: &DbGroupId, conn: PooledConnection) {
+        match group_id {
+            DbGroupId::Shard(index) => {
+                let pools = self.shard_master_pools.read().await;
+                if let Some(pool) = pools.get(*index) {
+                    pool.put(conn).await;
+                }
+            }
+            DbGroupId::Home => {
+                if let Some(pool) = self.home_master_pool.read().await.as_ref() {
+                    pool.put(conn).await;
+                }
             }
         }
-        drop(slaves); // Release lock before fallback
-
-        // Fall back to master
-        self.get_master(shard_id).await
     }
 
-    /// Return a connection to the master pool
-    pub async fn put_master(&self, shard_id: &ShardId, conn: PooledConnection) {
-        let pools = self.stateless_pools.read().await;
-        if let Some(pool) = pools.get(shard_id) {
-            pool.put(conn).await;
-        } else if let Some(pool) = pools.get(&ShardId::default_shard()) {
-            pool.put(conn).await;
-        }
-    }
-
-    /// Return a connection to a slave pool
-    ///
-    /// Finds the correct slave pool by matching the connection's backend address.
-    pub async fn put_slave(&self, shard_id: &ShardId, conn: PooledConnection) {
+    /// Return a slave connection
+    pub async fn put_slave(&self, group_id: &DbGroupId, conn: PooledConnection) {
         let conn_addr = conn.backend_addr().to_string();
 
-        // Find the slave pool that matches this connection's backend address
-        let matching_pool = {
-            let slaves = self.slave_pools.read().await;
-            slaves.get(shard_id).and_then(|g| g.find_by_addr(&conn_addr))
+        let matching_pool = match group_id {
+            DbGroupId::Shard(index) => {
+                let slaves = self.shard_slave_pools.read().await;
+                slaves.get(*index).and_then(|g| g.as_ref()).and_then(|g| g.find_by_addr(&conn_addr))
+            }
+            DbGroupId::Home => {
+                let slave_group = self.home_slave_pool.read().await;
+                slave_group.as_ref().and_then(|g| g.find_by_addr(&conn_addr))
+            }
         };
 
         if let Some(pool) = matching_pool {
             pool.put(conn).await;
         } else {
-            // Connection didn't match any slave pool, discard it
-            debug!(
-                shard = %shard_id.0,
-                addr = %conn_addr,
-                "Slave connection didn't match any pool, discarding"
-            );
-            drop(conn);
+            debug!(group = %group_id, addr = %conn_addr, "Slave connection didn't match any pool, discarding");
         }
     }
 
-    /// Get connection based on route target (Master or Slave)
+    /// Get connection by route target
     pub async fn get_for_target(
         &self,
-        shard_id: &ShardId,
+        group_id: &DbGroupId,
         target: crate::router::RouteTarget,
     ) -> Result<PooledConnection, ConnectionError> {
         match target {
-            crate::router::RouteTarget::Master => self.get_master(shard_id).await,
-            crate::router::RouteTarget::Slave => self.get_slave(shard_id).await,
+            crate::router::RouteTarget::Master => self.get_master(group_id).await,
+            crate::router::RouteTarget::Slave => self.get_slave(group_id).await,
         }
     }
 
-    /// Return connection based on route target
+    /// Return connection by route target
     pub async fn put_for_target(
         &self,
-        shard_id: &ShardId,
+        group_id: &DbGroupId,
         target: crate::router::RouteTarget,
         conn: PooledConnection,
     ) {
         match target {
-            crate::router::RouteTarget::Master => self.put_master(shard_id, conn).await,
-            crate::router::RouteTarget::Slave => self.put_slave(shard_id, conn).await,
+            crate::router::RouteTarget::Master => self.put_master(group_id, conn).await,
+            crate::router::RouteTarget::Slave => self.put_slave(group_id, conn).await,
         }
     }
 
-    /// Get the transaction pool
-    pub fn transaction_pool(&self) -> &Arc<TransactionPool> {
-        &self.transaction_pool
-    }
-
-    /// Get or create a transaction connection for a session
-    ///
-    /// Routes to the correct shard's master backend.
+    /// Begin transaction
     pub async fn begin_transaction(
         &self,
         session_id: u32,
-        shard_id: &ShardId,
+        group_id: &DbGroupId,
         database: Option<String>,
     ) -> Result<(), ConnectionError> {
-        // Get backend config for the specified shard
-        let backends = self.backends.read().await;
-        let backend = backends
-            .get(shard_id)
-            .or_else(|| backends.get(&ShardId::default_shard()))
-            .ok_or(ConnectionError::Disconnected)?;
+        let backend = match group_id {
+            DbGroupId::Shard(index) => {
+                let backends = self.shard_backends.read().await;
+                backends.get(*index).cloned()
+            }
+            DbGroupId::Home => self.home_backend.read().await.clone(),
+        };
 
+        let backend = backend.ok_or(ConnectionError::Disconnected)?;
         self.transaction_pool
             .get_or_create(session_id, &backend.master, database)
             .await
     }
 
-    /// End a transaction and handle the connection
-    ///
-    /// For normally completed transactions (COMMIT/ROLLBACK success), the connection
-    /// is restored to autocommit=1 mode and returned to the master pool for reuse.
-    /// For abnormal exits (client disconnect, error), the connection is discarded.
-    pub async fn end_transaction(&self, session_id: u32, shard_id: Option<&ShardId>, transaction_completed: bool) {
-        // Get the master pool for returning the connection
-        let pool = if let Some(shard_id) = shard_id {
-            let pools = self.stateless_pools.read().await;
-            pools
-                .get(shard_id)
-                .or_else(|| pools.get(&ShardId::default_shard()))
-                .cloned()
-        } else {
-            let pools = self.stateless_pools.read().await;
-            pools.get(&ShardId::default_shard()).cloned()
+    /// End transaction
+    pub async fn end_transaction(
+        &self,
+        session_id: u32,
+        group_id: Option<&DbGroupId>,
+        transaction_completed: bool,
+    ) {
+        let pool = match group_id {
+            Some(DbGroupId::Shard(index)) => {
+                let pools = self.shard_master_pools.read().await;
+                pools.get(*index).cloned()
+            }
+            Some(DbGroupId::Home) | None => self.home_master_pool.read().await.clone(),
         };
 
         self.transaction_pool
@@ -296,33 +389,13 @@ impl PoolManager {
             .await;
     }
 
-    /// Check if session has an active transaction
-    pub async fn has_transaction(&self, session_id: u32) -> bool {
-        self.transaction_pool.has_bound(session_id).await
+    /// Get transaction pool
+    pub fn transaction_pool(&self) -> &Arc<TransactionPool> {
+        &self.transaction_pool
     }
 
-    /// Get pool statistics
-    pub async fn stats(&self) -> PoolStats {
-        let mut total_idle = 0;
-        {
-            let pools = self.stateless_pools.read().await;
-            for pool in pools.values() {
-                total_idle += pool.idle_count();
-            }
-        }
-
-        let transaction_bound = self.transaction_pool.bound_count().await;
-
-        PoolStats {
-            total_idle_connections: total_idle,
-            transaction_bound_connections: transaction_bound,
-        }
+    /// Get shard count
+    pub async fn shard_count(&self) -> usize {
+        self.shard_master_pools.read().await.len()
     }
-}
-
-/// Pool statistics
-#[derive(Debug, Clone)]
-pub struct PoolStats {
-    pub total_idle_connections: usize,
-    pub transaction_bound_connections: usize,
 }

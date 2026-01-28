@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
-use crate::config::{BackendConfig, Config, DBGroupConfig, DBInstanceConfig, GroupConfig};
+use crate::config::{Config, DBGroupConfig, DBInstanceConfig, GroupConfig, BackendConfig};
 use crate::health::InstanceRegistry;
-use crate::pool::{PoolManager, ShardBackend, ShardId, StatelessPoolConfig};
+use crate::pool::{DbGroupBackend, PoolManager, StatelessPoolConfig};
 use crate::router::RouterConfig;
 
 /// Context for a single group (tenant)
@@ -43,19 +43,22 @@ impl GroupContext {
 /// Provides:
 /// - Group lookup by name (username maps 1:1 to group name)
 /// - Shared health registry across all groups
-/// - Default group fallback for legacy compatibility
 pub struct GroupManager {
     /// Groups by name
     groups: DashMap<String, Arc<GroupContext>>,
     /// Shared health registry (de-duplicates health checks across groups)
     health_registry: Arc<InstanceRegistry>,
-    /// Default group for legacy/fallback
-    default_group: Option<Arc<GroupContext>>,
 }
 
 impl GroupManager {
     /// Create a new group manager from configuration (async)
+    ///
+    /// Requires at least one group to be configured.
     pub async fn new(config: &Config) -> Self {
+        if config.groups.is_empty() {
+            panic!("No groups configured! At least one group must be defined in configuration.");
+        }
+
         let health_registry = Arc::new(InstanceRegistry::with_config(config.health.clone()));
         let groups = DashMap::new();
         let pool_config = StatelessPoolConfig::default();
@@ -72,22 +75,9 @@ impl GroupManager {
             groups.insert(group_config.name.clone(), Arc::new(context));
         }
 
-        // Build default group from legacy backend config (fallback)
-        let default_group = if config.groups.is_empty() {
-            info!("No groups configured, using legacy backend as default");
-            Some(Arc::new(Self::build_default_group(
-                &config.backend,
-                &health_registry,
-                &pool_config,
-            )))
-        } else {
-            None
-        };
-
         Self {
             groups,
             health_registry,
-            default_group,
         }
     }
 
@@ -121,6 +111,9 @@ impl GroupManager {
     }
 
     /// Build pool manager for a group's db_groups
+    ///
+    /// db_groups are added by index order (0, 1, 2, ...).
+    /// The first db_group is also used as the home group fallback.
     async fn build_pool_manager(
         db_groups: &[DBGroupConfig],
         health_registry: &Arc<InstanceRegistry>,
@@ -144,10 +137,8 @@ impl GroupManager {
 
         let pool_manager = PoolManager::new(default_backend, pool_config.clone());
 
-        // Add all shards
-        for db_group in db_groups {
-            let shard_id = ShardId(db_group.name.clone());
-
+        // Add all shards by index order
+        for (index, db_group) in db_groups.iter().enumerate() {
             // Collect masters and slaves
             let masters: Vec<&DBInstanceConfig> = db_group.masters();
             let slaves: Vec<&DBInstanceConfig> = db_group.slaves();
@@ -169,11 +160,13 @@ impl GroupManager {
             let slave_configs: Vec<BackendConfig> =
                 slaves.iter().map(|s| s.to_backend_config()).collect();
 
-            let shard_backend = ShardBackend {
-                shard_id: shard_id.clone(),
+            // Create new-style DbGroupBackend
+            let db_group_backend = DbGroupBackend {
                 master,
                 slaves: slave_configs,
             };
+
+            pool_manager.add_shard(index, db_group_backend).await;
 
             // Register instances for health checks
             for inst in &db_group.instances {
@@ -181,36 +174,20 @@ impl GroupManager {
                 debug!(
                     addr = %inst.addr(),
                     role = ?inst.role,
+                    db_group = %db_group.name,
+                    index = index,
                     "Registered instance for health checks"
                 );
             }
 
-            pool_manager.add_shard(shard_backend).await;
+            debug!(
+                db_group = %db_group.name,
+                index = index,
+                "Added db_group at index"
+            );
         }
 
         pool_manager
-    }
-
-    /// Build default group from legacy backend config
-    fn build_default_group(
-        backend: &BackendConfig,
-        health_registry: &Arc<InstanceRegistry>,
-        pool_config: &StatelessPoolConfig,
-    ) -> GroupContext {
-        let pool_manager = PoolManager::new(backend.clone(), pool_config.clone());
-
-        // Register the default backend for health checks
-        let instance_config = DBInstanceConfig::from(backend);
-        health_registry.register(&instance_config);
-
-        GroupContext {
-            name: "default".to_string(),
-            // Default group uses backend credentials for proxy auth (legacy mode)
-            auth_user: backend.user.clone(),
-            auth_password: backend.password.clone(),
-            pool_manager: Arc::new(pool_manager),
-            router_config: RouterConfig::new(),
-        }
     }
 
     /// Get group by name
@@ -223,17 +200,15 @@ impl GroupManager {
     /// Get group by database name
     ///
     /// Group name = database name (client connects with database that maps to group)
-    /// Falls back to default group if not found.
     pub fn get_by_database(&self, database: &str) -> Option<Arc<GroupContext>> {
-        self.get(database).or_else(|| self.default_group.clone())
+        self.get(database)
     }
 
     /// Get group for a username
     ///
-    /// In groups-only mode, username maps 1:1 to group name.
-    /// Falls back to default group if not found.
+    /// Username maps 1:1 to group name.
     pub fn get_for_user(&self, username: &str) -> Option<Arc<GroupContext>> {
-        self.get(username).or_else(|| self.default_group.clone())
+        self.get(username)
     }
 
     /// Get the shared health registry
@@ -244,15 +219,5 @@ impl GroupManager {
     /// Get list of all group names
     pub fn group_names(&self) -> Vec<String> {
         self.groups.iter().map(|r| r.key().clone()).collect()
-    }
-
-    /// Check if any groups are configured
-    pub fn has_groups(&self) -> bool {
-        !self.groups.is_empty()
-    }
-
-    /// Get default group (legacy fallback)
-    pub fn default_group(&self) -> Option<Arc<GroupContext>> {
-        self.default_group.clone()
     }
 }

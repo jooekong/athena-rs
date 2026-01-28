@@ -1,7 +1,21 @@
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::shard::{ShardAlgorithm, ShardCalculator};
+
+/// Convert string to lowercase, avoiding allocation if already lowercase.
+/// Returns Cow::Borrowed if input is already lowercase (no allocation),
+/// or Cow::Owned if conversion was needed.
+#[inline]
+fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
+    // Check if already lowercase (common case for SQL table names)
+    if s.bytes().all(|b| !b.is_ascii_uppercase()) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(s.to_lowercase())
+    }
+}
 
 /// Sharding rule configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -77,14 +91,16 @@ impl RouterConfig {
 
     /// Find the rule for a table
     pub fn find_rule(&self, table_name: &str) -> Option<&ShardingRule> {
-        let key = table_name.to_lowercase();
-        self.rules.get(&key)
+        // Use Cow to avoid allocation when input is already lowercase
+        let key = to_lowercase_cow(table_name);
+        self.rules.get(key.as_ref())
     }
 
     /// Find the calculator for a table
     pub fn find_calculator(&self, table_name: &str) -> Option<&ShardCalculator> {
-        let key = table_name.to_lowercase();
-        self.calculators.get(&key)
+        // Use Cow to avoid allocation when input is already lowercase
+        let key = to_lowercase_cow(table_name);
+        self.calculators.get(key.as_ref())
     }
 
     /// Check if a table is sharded

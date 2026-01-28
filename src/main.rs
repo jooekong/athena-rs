@@ -44,17 +44,12 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let config = load_or_default_config();
 
-    // Create group manager (groups-only architecture)
+    // Create group manager (groups are required)
     let group_manager = Arc::new(GroupManager::new(&config).await);
-
-    if group_manager.has_groups() {
-        info!(
-            groups = ?group_manager.group_names(),
-            "Groups configured (groups-only mode)"
-        );
-    } else {
-        info!("No groups configured, using legacy backend as default");
-    }
+    info!(
+        groups = ?group_manager.group_names(),
+        "Groups configured"
+    );
 
     // Create concurrency controller for rate limiting (legacy, will migrate to per-instance)
     let limit_config = LimitConfig::from(&config.circuit);
