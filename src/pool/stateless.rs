@@ -1,9 +1,9 @@
-use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use crossbeam_queue::SegQueue;
+use tracing::debug;
 
 use crate::config::BackendConfig;
 
@@ -34,14 +34,20 @@ impl Default for StatelessPoolConfig {
 ///
 /// Connections are borrowed and returned after each request.
 /// The pool maintains a set of idle connections for reuse.
+///
+/// This pool is lock-free for high concurrency performance.
+/// Each pool is defined by endpoint:port/database+user, so all connections
+/// in the pool share the same database and credentials.
 pub struct StatelessPool {
     /// Pool configuration
     config: StatelessPoolConfig,
     /// Backend configuration
     backend_config: Arc<BackendConfig>,
-    /// Idle connections
-    idle: Mutex<VecDeque<PooledConnection>>,
-    /// Current database for connections
+    /// Idle connections (lock-free queue)
+    idle: SegQueue<PooledConnection>,
+    /// Current idle count (approximate, for pool-full check)
+    idle_count: AtomicUsize,
+    /// Database for this pool (used when creating new connections)
     database: Option<String>,
 }
 
@@ -55,7 +61,8 @@ impl StatelessPool {
         Self {
             config: pool_config,
             backend_config,
-            idle: Mutex::new(VecDeque::new()),
+            idle: SegQueue::new(),
+            idle_count: AtomicUsize::new(0),
             database,
         }
     }
@@ -63,41 +70,32 @@ impl StatelessPool {
     /// Get a connection from the pool
     ///
     /// Returns an idle connection if available, otherwise creates a new one.
+    /// This method is lock-free.
     pub async fn get(&self) -> Result<PooledConnection, ConnectionError> {
-        // Try to get an idle connection
-        {
-            let mut idle = self.idle.lock().await;
-            while let Some(mut conn) = idle.pop_front() {
-                // Check if connection is still usable
-                if conn.is_expired(self.config.max_age) {
-                    debug!("Connection expired, discarding");
-                    continue;
-                }
+        // Try to get an idle connection (lock-free)
+        while let Some(mut conn) = self.idle.pop() {
+            self.idle_count.fetch_sub(1, Ordering::Relaxed);
 
-                if conn.is_idle_too_long(self.config.max_idle_time) {
-                    debug!("Connection idle too long, discarding");
-                    continue;
-                }
-
-                // Check if database matches
-                if self.database != conn.database {
-                    if let Some(ref db) = self.database {
-                        if conn.change_database(db).await.is_err() {
-                            warn!("Failed to change database, discarding connection");
-                            continue;
-                        }
-                    }
-                }
-
-                conn.acquire();
-                debug!("Reusing idle connection");
-                return Ok(conn);
+            // Check if connection is still usable
+            if conn.is_expired(self.config.max_age) {
+                debug!("Connection expired, discarding");
+                continue;
             }
+
+            if conn.is_idle_too_long(self.config.max_idle_time) {
+                debug!("Connection idle too long, discarding");
+                continue;
+            }
+
+            conn.acquire();
+            debug!("Reusing idle connection");
+            return Ok(conn);
         }
 
         // Create a new connection
         debug!("Creating new connection");
-        let mut conn = PooledConnection::connect(&self.backend_config, self.database.clone()).await?;
+        let mut conn =
+            PooledConnection::connect(&self.backend_config, self.database.clone()).await?;
         conn.acquire();
         Ok(conn)
     }
@@ -105,7 +103,11 @@ impl StatelessPool {
     /// Return a connection to the pool
     ///
     /// If the pool is full, the connection is dropped.
-    /// Connection is reset before returning to pool to prevent state leakage.
+    /// This method is lock-free.
+    ///
+    /// Note: No reset() is called because:
+    /// 1. Session variables are not supported (intercepted at proxy level)
+    /// 2. Each pool is defined by endpoint:port/database+user, no database switching needed
     pub async fn put(&self, mut conn: PooledConnection) {
         conn.release();
 
@@ -120,35 +122,31 @@ impl StatelessPool {
             return;
         }
 
-        // Reset connection state to prevent session state leakage
-        // COM_RESET_CONNECTION clears session variables, temp tables, prepared statements, etc.
-        if !conn.reset().await {
-            warn!("Failed to reset connection, discarding");
-            return;
-        }
-
-        let mut idle = self.idle.lock().await;
-
-        // Check if pool is full
-        if idle.len() >= self.config.max_idle {
+        // Best-effort pool size limit. Due to lock-free design, actual idle count
+        // may slightly exceed max_idle under high concurrency. This is acceptable
+        // as it only affects memory usage marginally.
+        if self.idle_count.load(Ordering::Relaxed) >= self.config.max_idle {
             debug!("Pool full, discarding connection");
             return;
         }
 
-        idle.push_back(conn);
-        debug!(idle_count = idle.len(), "Returned connection to pool");
+        self.idle.push(conn);
+        self.idle_count.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            idle_count = self.idle_count.load(Ordering::Relaxed),
+            "Returned connection to pool"
+        );
     }
 
-    /// Get current number of idle connections
-    pub async fn idle_count(&self) -> usize {
-        self.idle.lock().await.len()
+    /// Get current number of idle connections (approximate)
+    pub fn idle_count(&self) -> usize {
+        self.idle_count.load(Ordering::Relaxed)
     }
 
     /// Close all idle connections
-    pub async fn close_all(&self) {
-        let mut idle = self.idle.lock().await;
-        for conn in idle.drain(..) {
-            drop(conn);
+    pub fn close_all(&self) {
+        while self.idle.pop().is_some() {
+            self.idle_count.fetch_sub(1, Ordering::Relaxed);
         }
         debug!("Closed all idle connections");
     }

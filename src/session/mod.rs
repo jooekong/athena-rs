@@ -235,7 +235,7 @@ impl Session {
         let shard_id = ShardId::default_shard();
         let test_conn = self
             .pool_manager
-            .get_master(&shard_id, self.state.database.clone())
+            .get_master(&shard_id)
             .await
             .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
         // Return connection immediately
@@ -256,9 +256,10 @@ impl Session {
         // Step 5: Main command loop
         let result = self.command_loop(&mut client).await;
 
-        // Cleanup: release any bound transaction connection
+        // Cleanup: release any bound transaction connection (abnormal exit)
         if self.state.in_transaction {
-            self.pool_manager.end_transaction(self.id).await;
+            let shard_id = self.state.transaction_shard.as_ref().map(|s| ShardId(s.clone()));
+            self.pool_manager.end_transaction(self.id, shard_id.as_ref(), false).await;
         }
 
         result
@@ -367,8 +368,9 @@ impl Session {
 
             // Handle transaction end
             if cmd.ends_transaction() {
+                let shard_id = self.state.transaction_shard.as_ref().map(|s| ShardId(s.clone()));
                 self.state.end_transaction();
-                self.pool_manager.end_transaction(self.id).await;
+                self.pool_manager.end_transaction(self.id, shard_id.as_ref(), true).await;
             }
         }
     }
@@ -440,8 +442,9 @@ impl Session {
                     .send(ok.encode(1, self.state.capability_flags))
                     .await?;
             }
+            let shard_id = self.state.transaction_shard.as_ref().map(|s| ShardId(s.clone()));
             self.state.end_transaction();
-            self.pool_manager.end_transaction(self.id).await;
+            self.pool_manager.end_transaction(self.id, shard_id.as_ref(), true).await;
             return Ok(());
         }
 
@@ -824,7 +827,7 @@ impl Session {
 
             let mut conn = self
                 .pool_manager
-                .get_for_target(shard_id, route_result.target, None)
+                .get_for_target(shard_id, route_result.target)
                 .await
                 .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
 
@@ -1148,7 +1151,7 @@ impl Session {
             // Scatter queries are always for sharded tables, so don't use session database
             let mut conn = self
                 .pool_manager
-                .get_for_target(shard_id, route_result.target, None)
+                .get_for_target(shard_id, route_result.target)
                 .await
                 .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
 
@@ -1463,7 +1466,7 @@ impl Session {
     /// Execute command using stateless pooled connection (extended version)
     /// 
     /// `single_eof` - if true, response has only one EOF (e.g., COM_FIELD_LIST)
-    /// `use_session_db` - if true, use session's database; if false, use shard's configured database
+    /// `_use_session_db` - deprecated, kept for API compatibility
     async fn execute_with_pooled_ex<C>(
         &self,
         client: &mut Framed<C, PacketCodec>,
@@ -1471,23 +1474,16 @@ impl Session {
         shard_id: &ShardId,
         target: RouteTarget,
         single_eof: bool,
-        use_session_db: bool,
+        _use_session_db: bool,
     ) -> Result<(), SessionError>
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
         // Get connection from pool based on target
-        // For sharded tables, use the shard's configured database (pass None)
-        // For non-sharded (home) tables, use the session's database
-        let database = if use_session_db {
-            self.state.database.clone()
-        } else {
-            None
-        };
-        
+        // Each pool is defined by endpoint:port/database+user, no database switching needed
         let mut conn = self
             .pool_manager
-            .get_for_target(shard_id, target, database)
+            .get_for_target(shard_id, target)
             .await
             .map_err(|e| SessionError::BackendConnect(e.to_string()))?;
 

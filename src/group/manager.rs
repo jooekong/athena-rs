@@ -228,11 +228,10 @@ impl GroupManager {
         self.get(database).or_else(|| self.default_group.clone())
     }
 
-    /// Get group for a username (deprecated, use get_by_database instead)
+    /// Get group for a username
     ///
     /// In groups-only mode, username maps 1:1 to group name.
     /// Falls back to default group if not found.
-    #[deprecated(note = "Use get_by_database instead")]
     pub fn get_for_user(&self, username: &str) -> Option<Arc<GroupContext>> {
         self.get(username).or_else(|| self.default_group.clone())
     }
