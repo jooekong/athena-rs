@@ -861,9 +861,12 @@ impl Session {
                     error = %e,
                     "Aggregate scatter failed on shard"
                 );
+                // Record error in metrics for observability
+                metrics().record_query_error("scatter_shard_error");
                 // Send error to client
                 let err = ErrPacket::new(1105, "HY000", &format!("Shard error: {}", e));
                 client.send(err.encode(1, self.state.capability_flags)).await?;
+                // Return Ok to keep session alive (error already sent to client)
                 return Ok(());
             }
 
@@ -1181,7 +1184,10 @@ impl Session {
                     error = %e,
                     "Scatter query aborted due to shard error"
                 );
-                return Ok(()); // Error already sent to client, don't disconnect session
+                // Record error in metrics for observability
+                metrics().record_query_error("scatter_shard_error");
+                // Return Ok to keep session alive (error already sent to client)
+                return Ok(());
             }
 
             // permit is automatically released when it goes out of scope
@@ -1697,11 +1703,13 @@ pub enum SessionError {
 }
 
 /// Truncate SQL for logging (avoid huge log entries)
-fn truncate_sql(sql: &str, max_len: usize) -> String {
+///
+/// Uses Cow to avoid allocation when truncation is not needed.
+fn truncate_sql(sql: &str, max_len: usize) -> std::borrow::Cow<'_, str> {
     if sql.len() <= max_len {
-        sql.to_string()
+        std::borrow::Cow::Borrowed(sql)
     } else {
-        format!("{}...", &sql[..max_len])
+        std::borrow::Cow::Owned(format!("{}...", &sql[..max_len]))
     }
 }
 

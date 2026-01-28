@@ -80,13 +80,27 @@ impl Router {
                 };
 
                 // Intersect with existing shards if any
+                // Use sorted vectors for O(n) intersection without HashSet allocation
                 target_shards = Some(match target_shards {
-                    Some(existing) => {
-                        let shards_set: std::collections::HashSet<_> = shards.into_iter().collect();
-                        existing
-                            .into_iter()
-                            .filter(|s| shards_set.contains(s))
-                            .collect()
+                    Some(mut existing) => {
+                        let mut shards = shards;
+                        existing.sort_unstable();
+                        shards.sort_unstable();
+                        // Two-pointer intersection
+                        let mut result = Vec::new();
+                        let (mut i, mut j) = (0, 0);
+                        while i < existing.len() && j < shards.len() {
+                            match existing[i].cmp(&shards[j]) {
+                                std::cmp::Ordering::Less => i += 1,
+                                std::cmp::Ordering::Greater => j += 1,
+                                std::cmp::Ordering::Equal => {
+                                    result.push(existing[i]);
+                                    i += 1;
+                                    j += 1;
+                                }
+                            }
+                        }
+                        result
                     }
                     None => shards,
                 });
@@ -98,8 +112,8 @@ impl Router {
             Some(s) if !s.is_empty() => (s.clone(), false, false),
             Some(_) => {
                 // Empty intersection: multiple sharded tables with no common shard
-                // Fall back to shard 0 but flag it
-                (vec![0], true, false)
+                // Return empty shards - caller MUST check empty_intersection flag
+                (vec![], true, false)
             }
             None => {
                 // No sharded tables - use "home" db_group if available
@@ -332,8 +346,8 @@ mod tests {
             order_id,
             calc.calculate_i64(order_id)
         );
-        // Should still have a shard (fallback)
-        assert!(!result.shards.is_empty());
+        // Shards should be empty when intersection is empty
+        assert!(result.shards.is_empty());
     }
 
     #[test]

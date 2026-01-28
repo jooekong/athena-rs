@@ -2,14 +2,18 @@ use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_util::codec::Framed;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::config::BackendConfig;
 use crate::protocol::{
     capabilities, compute_auth_response, is_err_packet, is_ok_packet, ErrPacket,
     HandshakeResponse, InitialHandshake, OkPacket, Packet, PacketCodec,
 };
+
+/// Timeout for ping/reset operations (prevents hanging on unresponsive backend)
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +137,20 @@ impl PooledConnection {
     }
 
     /// Check if connection is healthy by sending a ping
+    ///
+    /// Uses a timeout to prevent hanging on unresponsive backends.
     pub async fn ping(&mut self) -> bool {
+        match timeout(PING_TIMEOUT, self.ping_inner()).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!("Ping timeout after {:?}", PING_TIMEOUT);
+                self.state = ConnectionState::Closed;
+                false
+            }
+        }
+    }
+
+    async fn ping_inner(&mut self) -> bool {
         // Send COM_PING
         let ping_packet = Packet::new(0, vec![0x0e]); // COM_PING = 0x0e
         if self.framed.send(ping_packet).await.is_err() {
@@ -160,7 +177,20 @@ impl PooledConnection {
     }
 
     /// Reset connection state (send COM_RESET_CONNECTION)
+    ///
+    /// Uses a timeout to prevent hanging on unresponsive backends.
     pub async fn reset(&mut self) -> bool {
+        match timeout(PING_TIMEOUT, self.reset_inner()).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!("Reset timeout after {:?}", PING_TIMEOUT);
+                self.state = ConnectionState::Closed;
+                false
+            }
+        }
+    }
+
+    async fn reset_inner(&mut self) -> bool {
         // Send COM_RESET_CONNECTION
         let reset_packet = Packet::new(0, vec![0x1f]); // COM_RESET_CONNECTION = 0x1f
         if self.framed.send(reset_packet).await.is_err() {
@@ -184,34 +214,6 @@ impl PooledConnection {
                 false
             }
         }
-    }
-
-    /// Change current database
-    pub async fn change_database(&mut self, db: &str) -> Result<(), ConnectionError> {
-        // Send COM_INIT_DB
-        let mut payload = vec![0x02]; // COM_INIT_DB = 0x02
-        payload.extend_from_slice(db.as_bytes());
-        let packet = Packet::new(0, payload);
-
-        self.framed.send(packet).await
-            .map_err(|e| ConnectionError::Io(e.to_string()))?;
-
-        // Receive response
-        let response = self.framed
-            .next()
-            .await
-            .ok_or(ConnectionError::Disconnected)?
-            .map_err(|e| ConnectionError::Io(e.to_string()))?;
-
-        if is_err_packet(&response.payload) {
-            let err = ErrPacket::parse(&response.payload, self.capabilities)
-                .unwrap_or_else(|| ErrPacket::new(1049, "42000", "Unknown database"));
-            return Err(ConnectionError::Database(err.error_message));
-        }
-
-        self.database = Some(db.to_string());
-        self.last_used_at = Instant::now();
-        Ok(())
     }
 
     /// Check if connection has exceeded max age

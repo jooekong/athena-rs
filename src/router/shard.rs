@@ -178,12 +178,10 @@ impl ShardCalculator {
     }
 
     fn calculate_range_int(&self, value: i64) -> usize {
-        for (i, &boundary) in self.range_boundaries.iter().enumerate() {
-            if value < boundary {
-                return i;
-            }
-        }
-        self.range_boundaries.len()
+        // Use binary search for O(log n) lookup
+        // partition_point returns the index of the first boundary > value
+        // which is exactly the shard index we need
+        self.range_boundaries.partition_point(|&b| b <= value)
     }
 }
 

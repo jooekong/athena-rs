@@ -6,6 +6,7 @@ use tracing::{debug, warn};
 use crate::config::BackendConfig;
 
 use super::connection::{ConnectionError, PooledConnection};
+use super::stateless::StatelessPool;
 
 /// A pool for transaction-bound connections
 ///
@@ -54,18 +55,19 @@ impl TransactionPool {
 
         // Set autocommit=0 for transaction semantics
         // This allows implicit transaction without explicit BEGIN
-        Self::set_autocommit_off(&mut conn).await?;
+        Self::set_autocommit(&mut conn, false).await?;
 
         bound.insert(session_id, conn);
         Ok(())
     }
 
-    /// Set autocommit=0 on the connection
-    async fn set_autocommit_off(conn: &mut PooledConnection) -> Result<(), ConnectionError> {
+    /// Set autocommit mode on the connection
+    async fn set_autocommit(conn: &mut PooledConnection, on: bool) -> Result<(), ConnectionError> {
         use crate::protocol::{is_err_packet, is_ok_packet, Packet};
 
+        let value = if on { "1" } else { "0" };
         let mut payload = vec![0x03]; // COM_QUERY
-        payload.extend_from_slice(b"SET autocommit=0");
+        payload.extend_from_slice(format!("SET autocommit={}", value).as_bytes());
         let packet = Packet {
             sequence_id: 0,
             payload: payload.into(),
@@ -75,24 +77,20 @@ impl TransactionPool {
 
         let response = conn.recv().await?;
         if is_err_packet(&response.payload) {
-            return Err(ConnectionError::Protocol("Failed to set autocommit=0".into()));
+            return Err(ConnectionError::Protocol(format!(
+                "Failed to set autocommit={}",
+                value
+            )));
         }
         if !is_ok_packet(&response.payload) {
-            return Err(ConnectionError::Protocol("Expected OK after SET autocommit".into()));
+            return Err(ConnectionError::Protocol(format!(
+                "Expected OK after SET autocommit={}",
+                value
+            )));
         }
 
-        debug!("Set autocommit=0 on transaction connection");
+        debug!("Set autocommit={} on connection", value);
         Ok(())
-    }
-
-    /// Get the bound connection for a session
-    pub async fn get(&self, session_id: u32) -> Option<()> {
-        let bound = self.bound.lock().await;
-        if bound.contains_key(&session_id) {
-            Some(())
-        } else {
-            None
-        }
     }
 
     /// Access the bound connection mutably
@@ -106,17 +104,28 @@ impl TransactionPool {
 
     /// Release the bound connection for a session
     ///
-    /// This should be called when the transaction ends (COMMIT/ROLLBACK).
-    /// The connection is dropped since transaction connections should not be reused.
-    pub async fn release(&self, session_id: u32) {
-        let mut bound = self.bound.lock().await;
-        if let Some(mut conn) = bound.remove(&session_id) {
-            // Reset connection state before dropping
-            if conn.reset().await {
-                debug!(session_id = session_id, "Reset and released bound connection");
-            } else {
-                warn!(session_id = session_id, "Failed to reset bound connection");
+    /// For normally committed/rolled-back transactions, the connection is clean
+    /// and can be returned to the stateless pool after restoring autocommit=1.
+    /// For abnormal exits (transaction not completed), the connection is discarded.
+    pub async fn release(
+        &self,
+        session_id: u32,
+        transaction_completed: bool,
+        stateless_pool: Option<&StatelessPool>,
+    ) {
+        if let Some(mut conn) = self.bound.lock().await.remove(&session_id) {
+            if transaction_completed {
+                // Transaction was properly committed/rolled back, connection is clean
+                if Self::set_autocommit(&mut conn, true).await.is_ok() {
+                    if let Some(pool) = stateless_pool {
+                        debug!(session_id, "Returning clean transaction connection to pool");
+                        pool.put(conn).await;
+                        return;
+                    }
+                }
             }
+            // Abnormal exit or failed to restore autocommit - discard connection
+            debug!(session_id, transaction_completed, "Discarding transaction connection");
         }
     }
 

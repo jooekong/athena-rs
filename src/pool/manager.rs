@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -9,6 +10,33 @@ use crate::config::BackendConfig;
 use super::connection::{ConnectionError, PooledConnection};
 use super::stateless::{StatelessPool, StatelessPoolConfig};
 use super::transaction::TransactionPool;
+
+/// A group of slave pools with its own round-robin counter
+struct SlavePoolGroup {
+    pools: Vec<Arc<StatelessPool>>,
+    counter: AtomicUsize,
+}
+
+impl SlavePoolGroup {
+    fn new(pools: Vec<Arc<StatelessPool>>) -> Self {
+        Self {
+            pools,
+            counter: AtomicUsize::new(0),
+        }
+    }
+
+    fn select(&self) -> Option<Arc<StatelessPool>> {
+        if self.pools.is_empty() {
+            return None;
+        }
+        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.pools.len();
+        Some(self.pools[idx].clone())
+    }
+
+    fn find_by_addr(&self, addr: &str) -> Option<Arc<StatelessPool>> {
+        self.pools.iter().find(|p| p.backend_addr() == addr).cloned()
+    }
+}
 
 /// Identifier for a shard/backend
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -35,16 +63,14 @@ pub struct ShardBackend {
 pub struct PoolManager {
     /// Stateless pools per shard (for master)
     stateless_pools: RwLock<HashMap<ShardId, Arc<StatelessPool>>>,
-    /// Stateless pools for slaves per shard
-    slave_pools: RwLock<HashMap<ShardId, Vec<Arc<StatelessPool>>>>,
+    /// Stateless pools for slaves per shard (each shard has its own round-robin counter)
+    slave_pools: RwLock<HashMap<ShardId, SlavePoolGroup>>,
     /// Transaction pool (shared, connections are bound to sessions)
     transaction_pool: Arc<TransactionPool>,
     /// Backend configurations per shard
     backends: RwLock<HashMap<ShardId, ShardBackend>>,
     /// Pool configuration
     pool_config: StatelessPoolConfig,
-    /// Slave selection counter (round-robin)
-    slave_counter: std::sync::atomic::AtomicUsize,
 }
 
 impl PoolManager {
@@ -77,7 +103,6 @@ impl PoolManager {
             transaction_pool,
             backends: RwLock::new(backends),
             pool_config,
-            slave_counter: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -113,7 +138,7 @@ impl PoolManager {
 
         if !slave_pools.is_empty() {
             let mut slaves = self.slave_pools.write().await;
-            slaves.insert(shard_id.clone(), slave_pools);
+            slaves.insert(shard_id.clone(), SlavePoolGroup::new(slave_pools));
         }
 
         {
@@ -125,11 +150,10 @@ impl PoolManager {
     }
 
     /// Get a connection from the master pool for a shard
-    pub async fn get_master(
-        &self,
-        shard_id: &ShardId,
-        database: Option<String>,
-    ) -> Result<PooledConnection, ConnectionError> {
+    ///
+    /// Note: No database switching is performed. Each pool is defined by
+    /// endpoint:port/database+user, and USE DATABASE is not supported.
+    pub async fn get_master(&self, shard_id: &ShardId) -> Result<PooledConnection, ConnectionError> {
         let pools = self.stateless_pools.read().await;
         let pool = if let Some(pool) = pools.get(shard_id) {
             pool.clone()
@@ -142,53 +166,25 @@ impl PoolManager {
         };
         drop(pools); // Release lock before async operation
 
-        let mut conn = pool.get().await?;
-
-        // Switch database if needed
-        if let Some(ref db) = database {
-            if conn.database.as_ref() != Some(db) {
-                conn.change_database(db).await?;
-            }
-        }
-
-        Ok(conn)
+        pool.get().await
     }
 
     /// Get a connection from a slave pool for a shard (round-robin)
     ///
+    /// Each shard has its own round-robin counter for even distribution.
     /// Falls back to master if no slaves available.
-    pub async fn get_slave(
-        &self,
-        shard_id: &ShardId,
-        database: Option<String>,
-    ) -> Result<PooledConnection, ConnectionError> {
+    pub async fn get_slave(&self, shard_id: &ShardId) -> Result<PooledConnection, ConnectionError> {
         let slaves = self.slave_pools.read().await;
-        if let Some(slave_pools) = slaves.get(shard_id) {
-            if !slave_pools.is_empty() {
-                // Round-robin selection
-                let idx = self
-                    .slave_counter
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    % slave_pools.len();
-                let pool = slave_pools[idx].clone();
+        if let Some(slave_group) = slaves.get(shard_id) {
+            if let Some(pool) = slave_group.select() {
                 drop(slaves); // Release lock before async operation
-
-                let mut conn = pool.get().await?;
-
-                // Switch database if needed
-                if let Some(ref db) = database {
-                    if conn.database.as_ref() != Some(db) {
-                        conn.change_database(db).await?;
-                    }
-                }
-
-                return Ok(conn);
+                return pool.get().await;
             }
         }
         drop(slaves); // Release lock before fallback
 
         // Fall back to master
-        self.get_master(shard_id, database).await
+        self.get_master(shard_id).await
     }
 
     /// Return a connection to the master pool
@@ -210,14 +206,7 @@ impl PoolManager {
         // Find the slave pool that matches this connection's backend address
         let matching_pool = {
             let slaves = self.slave_pools.read().await;
-            if let Some(slave_pools) = slaves.get(shard_id) {
-                slave_pools
-                    .iter()
-                    .find(|pool| pool.backend_addr() == conn_addr)
-                    .cloned()
-            } else {
-                None
-            }
+            slaves.get(shard_id).and_then(|g| g.find_by_addr(&conn_addr))
         };
 
         if let Some(pool) = matching_pool {
@@ -238,11 +227,10 @@ impl PoolManager {
         &self,
         shard_id: &ShardId,
         target: crate::router::RouteTarget,
-        database: Option<String>,
     ) -> Result<PooledConnection, ConnectionError> {
         match target {
-            crate::router::RouteTarget::Master => self.get_master(shard_id, database).await,
-            crate::router::RouteTarget::Slave => self.get_slave(shard_id, database).await,
+            crate::router::RouteTarget::Master => self.get_master(shard_id).await,
+            crate::router::RouteTarget::Slave => self.get_slave(shard_id).await,
         }
     }
 
@@ -285,9 +273,27 @@ impl PoolManager {
             .await
     }
 
-    /// End a transaction and release the connection
-    pub async fn end_transaction(&self, session_id: u32) {
-        self.transaction_pool.release(session_id).await;
+    /// End a transaction and handle the connection
+    ///
+    /// For normally completed transactions (COMMIT/ROLLBACK success), the connection
+    /// is restored to autocommit=1 mode and returned to the master pool for reuse.
+    /// For abnormal exits (client disconnect, error), the connection is discarded.
+    pub async fn end_transaction(&self, session_id: u32, shard_id: Option<&ShardId>, transaction_completed: bool) {
+        // Get the master pool for returning the connection
+        let pool = if let Some(shard_id) = shard_id {
+            let pools = self.stateless_pools.read().await;
+            pools
+                .get(shard_id)
+                .or_else(|| pools.get(&ShardId::default_shard()))
+                .cloned()
+        } else {
+            let pools = self.stateless_pools.read().await;
+            pools.get(&ShardId::default_shard()).cloned()
+        };
+
+        self.transaction_pool
+            .release(session_id, transaction_completed, pool.as_deref())
+            .await;
     }
 
     /// Check if session has an active transaction
@@ -301,7 +307,7 @@ impl PoolManager {
         {
             let pools = self.stateless_pools.read().await;
             for pool in pools.values() {
-                total_idle += pool.idle_count().await;
+                total_idle += pool.idle_count();
             }
         }
 
