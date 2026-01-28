@@ -80,13 +80,20 @@ impl Router {
                 };
 
                 // Intersect with existing shards if any
-                // Use sorted vectors for O(n) intersection without HashSet allocation
+                // Both vectors are already sorted:
+                // - existing: from previous intersection (sorted output)
+                // - shards: from calculate_all/all_shards/range (all return sorted)
                 target_shards = Some(match target_shards {
-                    Some(mut existing) => {
-                        let mut shards = shards;
-                        existing.sort_unstable();
-                        shards.sort_unstable();
-                        // Two-pointer intersection
+                    Some(existing) => {
+                        debug_assert!(
+                            existing.windows(2).all(|w| w[0] <= w[1]),
+                            "existing shards not sorted"
+                        );
+                        debug_assert!(
+                            shards.windows(2).all(|w| w[0] <= w[1]),
+                            "shards not sorted"
+                        );
+                        // Two-pointer intersection (O(n) without HashSet allocation)
                         let mut result = Vec::new();
                         let (mut i, mut j) = (0, 0);
                         while i < existing.len() && j < shards.len() {
