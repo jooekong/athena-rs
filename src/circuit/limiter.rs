@@ -84,35 +84,6 @@ impl Limiter {
         }
     }
 
-    /// Create a limiter with default configuration
-    pub fn with_defaults() -> Self {
-        Self::new(LimiterConfig::default())
-    }
-
-    /// Check if rate limiting is enabled
-    pub fn is_enabled(&self) -> bool {
-        self.config.enabled
-    }
-
-    /// Get the maximum concurrent requests allowed
-    pub fn max_concurrent(&self) -> usize {
-        self.config.max_concurrent
-    }
-
-    /// Get the number of available permits
-    pub fn available_permits(&self) -> usize {
-        self.semaphore.available_permits()
-    }
-
-    /// Get the number of active (acquired) permits
-    pub fn active_count(&self) -> usize {
-        self.config.max_concurrent - self.semaphore.available_permits()
-    }
-
-    /// Get the number of waiting requests
-    pub fn waiting_count(&self) -> usize {
-        self.waiting.load(Ordering::Relaxed)
-    }
 
     /// Acquire a permit for executing a request
     ///
@@ -176,43 +147,6 @@ impl Limiter {
         }
     }
 
-    /// Try to acquire a permit without waiting
-    ///
-    /// Returns `None` if no permit is available or rate limiting is disabled.
-    pub fn try_acquire(&self) -> Option<Permit> {
-        if !self.config.enabled {
-            return None;
-        }
-
-        match self.semaphore.clone().try_acquire_owned() {
-            Ok(permit) => {
-                self.stats.acquired.fetch_add(1, Ordering::Relaxed);
-                Some(Permit::new(permit))
-            }
-            Err(_) => None,
-        }
-    }
-
-    /// Get limiter statistics
-    pub fn stats(&self) -> Stats {
-        Stats {
-            total_acquired: self.stats.acquired.load(Ordering::Relaxed),
-            total_rejected_full: self.stats.rejected_full.load(Ordering::Relaxed),
-            total_rejected_timeout: self.stats.rejected_timeout.load(Ordering::Relaxed),
-            current_active: self.active_count(),
-            current_waiting: self.waiting_count(),
-        }
-    }
-}
-
-/// Public statistics for a limiter
-#[derive(Debug, Clone)]
-pub struct Stats {
-    pub total_acquired: usize,
-    pub total_rejected_full: usize,
-    pub total_rejected_timeout: usize,
-    pub current_active: usize,
-    pub current_waiting: usize,
 }
 
 // ============================================================================
@@ -240,16 +174,11 @@ impl LimitKey {
 /// Deprecated: Use Permit instead
 pub struct LimitPermit {
     _permit: OwnedSemaphorePermit,
-    key: LimitKey,
 }
 
 impl LimitPermit {
-    fn new(permit: OwnedSemaphorePermit, key: LimitKey) -> Self {
-        Self { _permit: permit, key }
-    }
-
-    pub fn key(&self) -> &LimitKey {
-        &self.key
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self { _permit: permit }
     }
 }
 
@@ -311,7 +240,7 @@ impl ConcurrencyController {
     }
 
     /// Acquire a permit (key is ignored in new implementation)
-    pub async fn acquire(&self, key: LimitKey) -> Result<LimitPermit, LimitError> {
+    pub async fn acquire(&self, _key: LimitKey) -> Result<LimitPermit, LimitError> {
         let permit = self.limiter.acquire().await?;
         // Convert internal permit to legacy LimitPermit
         // Note: We need to re-acquire since we can't move out of Permit
@@ -319,7 +248,7 @@ impl ConcurrencyController {
             .map_err(|_| LimitError::QueueFull { max: 0 })?;
         // Release the permit we just acquired
         drop(permit);
-        Ok(LimitPermit::new(owned, key))
+        Ok(LimitPermit::new(owned))
     }
 }
 
@@ -339,42 +268,13 @@ mod tests {
 
         // Acquire first permit
         let permit1 = limiter.acquire().await.unwrap();
-        assert_eq!(limiter.active_count(), 1);
 
         // Acquire second permit
         let permit2 = limiter.acquire().await.unwrap();
-        assert_eq!(limiter.active_count(), 2);
 
         // Drop permits
         drop(permit1);
-        assert_eq!(limiter.active_count(), 1);
         drop(permit2);
-        assert_eq!(limiter.active_count(), 0);
-
-        let stats = limiter.stats();
-        assert_eq!(stats.total_acquired, 2);
-    }
-
-    #[tokio::test]
-    async fn test_try_acquire() {
-        let config = LimiterConfig {
-            max_concurrent: 1,
-            max_queue_size: 10,
-            queue_timeout_ms: 1000,
-            enabled: true,
-        };
-        let limiter = Limiter::new(config);
-
-        // First try_acquire should succeed
-        let permit = limiter.try_acquire().unwrap();
-        assert_eq!(limiter.active_count(), 1);
-
-        // Second try_acquire should fail (no waiting)
-        assert!(limiter.try_acquire().is_none());
-
-        // After dropping, should succeed again
-        drop(permit);
-        assert!(limiter.try_acquire().is_some());
     }
 
     #[tokio::test]
@@ -458,55 +358,4 @@ mod tests {
         assert!(matches!(result, Err(LimitError::QueueFull { .. })));
     }
 
-    #[tokio::test]
-    async fn test_fast_path_no_queue_increment() {
-        // When permits are available, we should not increment waiting count
-        let config = LimiterConfig {
-            max_concurrent: 2,
-            max_queue_size: 1,
-            queue_timeout_ms: 100,
-            enabled: true,
-        };
-        let limiter = Arc::new(Limiter::new(config));
-
-        // Acquire both permits - should not increment waiting count
-        let _permit1 = limiter.acquire().await.unwrap();
-        let _permit2 = limiter.acquire().await.unwrap();
-        assert_eq!(limiter.waiting_count(), 0);
-
-        // Third acquire should be able to wait (queue_size=1)
-        let limiter_clone = limiter.clone();
-        let handle = tokio::spawn(async move {
-            limiter_clone.acquire().await
-        });
-
-        // Give it time to start waiting
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // Fourth acquire should fail with QueueFull (queue is now at capacity)
-        let result = limiter.acquire().await;
-        assert!(matches!(result, Err(LimitError::QueueFull { .. })));
-
-        // Clean up
-        drop(handle);
-    }
-
-    #[tokio::test]
-    async fn test_stats() {
-        let config = LimiterConfig {
-            max_concurrent: 2,
-            max_queue_size: 10,
-            queue_timeout_ms: 1000,
-            enabled: true,
-        };
-        let limiter = Limiter::new(config);
-
-        let _permit1 = limiter.acquire().await.unwrap();
-        let _permit2 = limiter.acquire().await.unwrap();
-
-        let stats = limiter.stats();
-        assert_eq!(stats.total_acquired, 2);
-        assert_eq!(stats.current_active, 2);
-        assert_eq!(stats.current_waiting, 0);
-    }
 }

@@ -94,11 +94,6 @@ pub struct InstanceHealth {
 }
 
 impl InstanceHealth {
-    /// Create a new InstanceHealth with Unknown status
-    pub fn new(addr: String, user: String, password: String) -> Self {
-        Self::with_config(addr, user, password, WindowConfig::default())
-    }
-
     /// Create with custom window configuration
     pub fn with_config(
         addr: String,
@@ -218,25 +213,6 @@ impl InstanceHealth {
         }
     }
 
-    /// Get time since last check
-    pub fn time_since_last_check(&self) -> Option<std::time::Duration> {
-        self.last_check.map(|t| t.elapsed())
-    }
-
-    /// Get time since last success
-    pub fn time_since_last_success(&self) -> Option<std::time::Duration> {
-        self.last_success.map(|t| t.elapsed())
-    }
-
-    /// Get current window size
-    pub fn window_len(&self) -> usize {
-        self.window.len()
-    }
-
-    /// Get window configuration
-    pub fn window_config(&self) -> &WindowConfig {
-        &self.config
-    }
 }
 
 #[cfg(test)]
@@ -254,15 +230,15 @@ mod tests {
 
     #[test]
     fn test_instance_health_new() {
-        let health = InstanceHealth::new(
+        let health = InstanceHealth::with_config(
             "localhost:3306".to_string(),
             "root".to_string(),
             "".to_string(),
+            WindowConfig::default(),
         );
         assert_eq!(health.status, HealthStatus::Unknown);
         assert!(health.is_available());
         assert!(!health.is_healthy());
-        assert_eq!(health.window_len(), 0);
     }
 
     #[test]
@@ -379,7 +355,6 @@ mod tests {
         }
         assert_eq!(health.status, HealthStatus::Unhealthy);
         assert_eq!(health.failure_count(), 5);
-        assert_eq!(health.window_len(), 5);
 
         // Add successes - old failures get evicted
         for _ in 0..5 {

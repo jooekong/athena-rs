@@ -129,7 +129,6 @@ Athena exposes Prometheus metrics on port `listen_port + 1000` (default: 4307).
 - `athena_queries_total` - Total queries processed
 - `athena_query_duration_seconds` - Query latency histogram
 - `athena_queries_routed_total` - Queries routed by target
-- `athena_pool_idle_connections` - Idle connections in pool
 - `athena_rate_limit_rejected_total` - Rate-limited requests
 
 ## Project Structure

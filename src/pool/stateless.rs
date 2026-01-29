@@ -138,19 +138,6 @@ impl StatelessPool {
         );
     }
 
-    /// Get current number of idle connections (approximate)
-    pub fn idle_count(&self) -> usize {
-        self.idle_count.load(Ordering::Relaxed)
-    }
-
-    /// Close all idle connections
-    pub fn close_all(&self) {
-        while self.idle.pop().is_some() {
-            self.idle_count.fetch_sub(1, Ordering::Relaxed);
-        }
-        debug!("Closed all idle connections");
-    }
-
     /// Get backend address (host:port) for this pool
     pub fn backend_addr(&self) -> String {
         format!("{}:{}", self.backend_config.host, self.backend_config.port)

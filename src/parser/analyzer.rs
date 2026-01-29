@@ -1,10 +1,9 @@
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, Query, Select, SelectItem,
-    SetExpr, Statement, TableFactor, TableWithJoins, Value,
+    BinaryOperator, Expr, Function, Query, SelectItem, SetExpr, Statement, TableFactor,
+    TableWithJoins, Value,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
-use tracing::debug;
 
 /// SQL analysis result
 #[derive(Debug, Clone)]
@@ -15,8 +14,6 @@ pub struct SqlAnalysis {
     pub tables: Vec<String>,
     /// Extracted shard key values (column_name -> values)
     pub shard_keys: Vec<(String, ShardKeyValue)>,
-    /// Whether this is a read-only query
-    pub is_read_only: bool,
     /// Aggregate functions detected in SELECT clause
     pub aggregates: Vec<AggregateInfo>,
 }
@@ -28,10 +25,6 @@ pub struct AggregateInfo {
     pub func_type: AggregateType,
     /// Position in SELECT list (0-indexed)
     pub position: usize,
-    /// Original expression string (for debugging)
-    pub expr_str: String,
-    /// Whether it's COUNT(*)
-    pub is_count_star: bool,
 }
 
 /// Supported aggregate function types
@@ -91,8 +84,6 @@ pub enum ShardKeyValue {
     Multiple(Vec<ShardValue>),
     /// Range (e.g., user_id BETWEEN 1 AND 100) - integers only
     Range { start: i64, end: i64 },
-    /// Unknown/not extractable
-    Unknown,
 }
 
 /// SQL Analyzer
@@ -118,7 +109,6 @@ impl SqlAnalyzer {
                 stmt_type: StatementType::Begin,
                 tables: vec![],
                 shard_keys: vec![],
-                is_read_only: false,
                 aggregates: vec![],
             });
         }
@@ -127,7 +117,6 @@ impl SqlAnalyzer {
                 stmt_type: StatementType::Commit,
                 tables: vec![],
                 shard_keys: vec![],
-                is_read_only: false,
                 aggregates: vec![],
             });
         }
@@ -136,7 +125,6 @@ impl SqlAnalyzer {
                 stmt_type: StatementType::Rollback,
                 tables: vec![],
                 shard_keys: vec![],
-                is_read_only: false,
                 aggregates: vec![],
             });
         }
@@ -216,7 +204,6 @@ impl SqlAnalyzer {
                     stmt_type: StatementType::Insert,
                     tables: vec![table],
                     shard_keys,
-                    is_read_only: false,
                     aggregates: vec![],
                 })
             }
@@ -231,7 +218,6 @@ impl SqlAnalyzer {
                     stmt_type: StatementType::Update,
                     tables: table_name.into_iter().collect(),
                     shard_keys,
-                    is_read_only: false,
                     aggregates: vec![],
                 })
             }
@@ -254,7 +240,6 @@ impl SqlAnalyzer {
                     stmt_type: StatementType::Delete,
                     tables,
                     shard_keys,
-                    is_read_only: false,
                     aggregates: vec![],
                 })
             }
@@ -262,7 +247,6 @@ impl SqlAnalyzer {
                 stmt_type: StatementType::Set,
                 tables: vec![],
                 shard_keys: vec![],
-                is_read_only: false,
                 aggregates: vec![],
             }),
             Statement::ShowTables { .. }
@@ -270,21 +254,18 @@ impl SqlAnalyzer {
                 stmt_type: StatementType::Show,
                 tables: vec![],
                 shard_keys: vec![],
-                is_read_only: true,
                 aggregates: vec![],
             }),
             Statement::Use { db_name } => Ok(SqlAnalysis {
                 stmt_type: StatementType::Use,
                 tables: vec![db_name.to_string()],
                 shard_keys: vec![],
-                is_read_only: false,
                 aggregates: vec![],
             }),
             _ => Ok(SqlAnalysis {
                 stmt_type: StatementType::Other,
                 tables: vec![],
                 shard_keys: vec![],
-                is_read_only: false,
                 aggregates: vec![],
             }),
         }
@@ -314,7 +295,6 @@ impl SqlAnalyzer {
             stmt_type: StatementType::Select,
             tables,
             shard_keys,
-            is_read_only: true,
             aggregates,
         })
     }
@@ -359,23 +339,10 @@ impl SqlAnalyzer {
             _ => None,
         }?;
 
-        // Check if it's COUNT(*)
-        let is_count_star = func_type == AggregateType::Count && self.is_count_star(func);
-
         Some(AggregateInfo {
             func_type,
             position,
-            expr_str: format!("{}", func),
-            is_count_star,
         })
-    }
-
-    /// Check if function is COUNT(*)
-    fn is_count_star(&self, func: &Function) -> bool {
-        if let Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) = func.args.first() {
-            return true;
-        }
-        false
     }
 
     fn extract_table_name_from_table_with_joins(
@@ -562,7 +529,7 @@ mod tests {
 
         assert_eq!(result.stmt_type, StatementType::Select);
         assert_eq!(result.tables, vec!["users"]);
-        assert!(result.is_read_only);
+        assert!(result.stmt_type.is_read_only());
         assert_eq!(result.shard_keys.len(), 1);
         assert_eq!(result.shard_keys[0].0, "user_id");
     }
@@ -647,7 +614,7 @@ mod tests {
 
         assert_eq!(result.stmt_type, StatementType::Insert);
         assert_eq!(result.tables, vec!["users"]);
-        assert!(!result.is_read_only);
+        assert!(!result.stmt_type.is_read_only());
     }
 
     #[test]

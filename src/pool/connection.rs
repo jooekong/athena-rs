@@ -2,18 +2,14 @@ use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
 use tokio_util::codec::Framed;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::config::BackendConfig;
 use crate::protocol::{
     capabilities, compute_auth_response, is_err_packet, is_ok_packet, ErrPacket,
-    HandshakeResponse, InitialHandshake, OkPacket, Packet, PacketCodec,
+    HandshakeResponse, InitialHandshake, Packet, PacketCodec,
 };
-
-/// Timeout for ping/reset operations (prevents hanging on unresponsive backend)
-const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,8 +34,6 @@ pub struct PooledConnection {
     pub(crate) last_used_at: Instant,
     /// Server capability flags
     pub(crate) capabilities: u32,
-    /// Current database
-    pub(crate) database: Option<String>,
     /// Backend address (host:port) for pool tracking
     pub(crate) backend_addr: String,
 }
@@ -131,89 +125,8 @@ impl PooledConnection {
             created_at: now,
             last_used_at: now,
             capabilities: caps,
-            database: db,
             backend_addr: addr,
         })
-    }
-
-    /// Check if connection is healthy by sending a ping
-    ///
-    /// Uses a timeout to prevent hanging on unresponsive backends.
-    pub async fn ping(&mut self) -> bool {
-        match timeout(PING_TIMEOUT, self.ping_inner()).await {
-            Ok(result) => result,
-            Err(_) => {
-                warn!("Ping timeout after {:?}", PING_TIMEOUT);
-                self.state = ConnectionState::Closed;
-                false
-            }
-        }
-    }
-
-    async fn ping_inner(&mut self) -> bool {
-        // Send COM_PING
-        let ping_packet = Packet::new(0, vec![0x0e]); // COM_PING = 0x0e
-        if self.framed.send(ping_packet).await.is_err() {
-            self.state = ConnectionState::Closed;
-            return false;
-        }
-
-        // Receive response
-        match self.framed.next().await {
-            Some(Ok(packet)) => {
-                if is_ok_packet(&packet.payload) {
-                    self.last_used_at = Instant::now();
-                    true
-                } else {
-                    self.state = ConnectionState::Closed;
-                    false
-                }
-            }
-            _ => {
-                self.state = ConnectionState::Closed;
-                false
-            }
-        }
-    }
-
-    /// Reset connection state (send COM_RESET_CONNECTION)
-    ///
-    /// Uses a timeout to prevent hanging on unresponsive backends.
-    pub async fn reset(&mut self) -> bool {
-        match timeout(PING_TIMEOUT, self.reset_inner()).await {
-            Ok(result) => result,
-            Err(_) => {
-                warn!("Reset timeout after {:?}", PING_TIMEOUT);
-                self.state = ConnectionState::Closed;
-                false
-            }
-        }
-    }
-
-    async fn reset_inner(&mut self) -> bool {
-        // Send COM_RESET_CONNECTION
-        let reset_packet = Packet::new(0, vec![0x1f]); // COM_RESET_CONNECTION = 0x1f
-        if self.framed.send(reset_packet).await.is_err() {
-            self.state = ConnectionState::Closed;
-            return false;
-        }
-
-        // Receive response
-        match self.framed.next().await {
-            Some(Ok(packet)) => {
-                if is_ok_packet(&packet.payload) {
-                    self.last_used_at = Instant::now();
-                    true
-                } else {
-                    self.state = ConnectionState::Closed;
-                    false
-                }
-            }
-            _ => {
-                self.state = ConnectionState::Closed;
-                false
-            }
-        }
     }
 
     /// Check if connection has exceeded max age
@@ -287,10 +200,6 @@ impl PooledConnection {
         }
     }
 
-    /// Get inner framed connection for direct access
-    pub fn inner(&mut self) -> &mut Framed<TcpStream, PacketCodec> {
-        &mut self.framed
-    }
 }
 
 /// Connection errors
@@ -307,9 +216,6 @@ pub enum ConnectionError {
 
     #[error("Authentication failed: {0}")]
     Auth(String),
-
-    #[error("Database error: {0}")]
-    Database(String),
 
     #[error("Connection disconnected")]
     Disconnected,

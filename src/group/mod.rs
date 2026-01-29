@@ -5,4 +5,4 @@
 
 mod manager;
 
-pub use manager::{GroupContext, GroupManager};
+pub use manager::GroupManager;

@@ -173,13 +173,13 @@ impl InstanceRegistry {
                 let changed = h.record_success(Some(role));
                 if changed {
                     info!(
-                        addr = %addr,
+                        addr = %h.addr,
                         role = ?role,
                         status = ?h.status,
                         "Instance status changed"
                     );
                 } else {
-                    debug!(addr = %addr, role = ?role, "Health check passed");
+                    debug!(addr = %h.addr, role = ?role, "Health check passed");
                 }
             }
             Ok(Err(e)) => {
@@ -189,9 +189,9 @@ impl InstanceRegistry {
                 let mut h = health.write();
                 let changed = h.record_failure();
                 if changed {
-                    warn!(addr = %addr, error = %e, status = ?h.status, "Instance status changed");
+                    warn!(addr = %h.addr, error = %e, status = ?h.status, "Instance status changed");
                 } else {
-                    debug!(addr = %addr, error = %e, "Health check failed");
+                    debug!(addr = %h.addr, error = %e, "Health check failed");
                 }
             }
             Err(_) => {
@@ -201,9 +201,9 @@ impl InstanceRegistry {
                 let mut h = health.write();
                 let changed = h.record_failure();
                 if changed {
-                    warn!(addr = %addr, "Instance status changed (timeout)");
+                    warn!(addr = %h.addr, "Instance status changed (timeout)");
                 } else {
-                    debug!(addr = %addr, "Health check timed out");
+                    debug!(addr = %h.addr, "Health check timed out");
                 }
             }
         }
@@ -263,81 +263,6 @@ impl InstanceRegistry {
         Ok((host, port))
     }
 
-    /// Unregister an instance
-    ///
-    /// Decrements reference count. If count reaches 0, cancels the health check task
-    /// and removes the instance.
-    pub fn unregister(&self, addr: &str) {
-        // Hold lock to prevent race with concurrent register/unregister
-        let _guard = self.register_lock.lock();
-
-        let should_remove = {
-            let mut entry = match self.ref_counts.get_mut(addr) {
-                Some(e) => e,
-                None => return,
-            };
-            *entry -= 1;
-            *entry == 0
-        };
-
-        if should_remove {
-            // Cancel the health check task
-            if let Some((_, token)) = self.cancellation_tokens.remove(addr) {
-                token.cancel();
-            }
-
-            self.ref_counts.remove(addr);
-            self.instances.remove(addr);
-            info!(addr = %addr, "Instance unregistered and health check task cancelled");
-        } else {
-            debug!(addr = %addr, ref_count = ?self.ref_counts.get(addr).map(|r| *r), "Instance unregistered (still has references)");
-        }
-    }
-
-    /// Cancel all health check tasks (for graceful shutdown)
-    pub fn shutdown(&self) {
-        info!("Shutting down health check registry");
-        for entry in self.cancellation_tokens.iter() {
-            entry.value().cancel();
-        }
-    }
-
-    /// Get all instances that need health checking
-    pub fn all_instances(&self) -> Vec<Arc<RwLock<InstanceHealth>>> {
-        self.instances.iter().map(|r| r.value().clone()).collect()
-    }
-
-    /// Check if an instance is healthy
-    pub fn is_healthy(&self, addr: &str) -> bool {
-        self.instances
-            .get(addr)
-            .map(|h| h.read().is_healthy())
-            .unwrap_or(false)
-    }
-
-    /// Check if an instance is available (healthy or unknown)
-    pub fn is_available(&self, addr: &str) -> bool {
-        self.instances
-            .get(addr)
-            .map(|h| h.read().is_available())
-            .unwrap_or(true) // Default to available if not registered
-    }
-
-    /// Get the health state for an instance
-    pub fn get(&self, addr: &str) -> Option<Arc<RwLock<InstanceHealth>>> {
-        self.instances.get(addr).map(|r| r.value().clone())
-    }
-
-    /// Get the number of registered instances
-    pub fn len(&self) -> usize {
-        self.instances.len()
-    }
-
-    /// Check if registry is empty
-    pub fn is_empty(&self) -> bool {
-        self.instances.is_empty()
-    }
-
     /// Get statistics about the registry
     pub fn stats(&self) -> RegistryStats {
         let mut healthy = 0;
@@ -346,10 +271,12 @@ impl InstanceRegistry {
 
         for entry in self.instances.iter() {
             let health = entry.value().read();
-            match health.status {
-                super::state::HealthStatus::Healthy => healthy += 1,
-                super::state::HealthStatus::Unhealthy => unhealthy += 1,
-                super::state::HealthStatus::Unknown => unknown += 1,
+            if health.is_healthy() {
+                healthy += 1;
+            } else if health.is_available() {
+                unknown += 1;
+            } else {
+                unhealthy += 1;
             }
         }
 
@@ -411,7 +338,7 @@ mod tests {
         let config = create_test_config("localhost", 3306);
 
         let health = registry.register(&config);
-        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.stats().total, 1);
 
         let h = health.read();
         assert_eq!(h.addr, "localhost:3306");
@@ -427,29 +354,11 @@ mod tests {
         let health2 = registry.register(&config);
 
         // Should be same instance
-        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.stats().total, 1);
         assert!(Arc::ptr_eq(&health1, &health2));
 
         // Ref count should be 2
         assert_eq!(*registry.ref_counts.get("localhost:3306").unwrap(), 2);
-    }
-
-    #[test]
-    fn test_unregister_decrements_refcount() {
-        let registry = create_test_registry();
-        let config = create_test_config("localhost", 3306);
-
-        registry.register(&config);
-        registry.register(&config);
-        assert_eq!(*registry.ref_counts.get("localhost:3306").unwrap(), 2);
-
-        registry.unregister("localhost:3306");
-        assert_eq!(*registry.ref_counts.get("localhost:3306").unwrap(), 1);
-        assert_eq!(registry.len(), 1);
-
-        registry.unregister("localhost:3306");
-        assert!(registry.ref_counts.get("localhost:3306").is_none());
-        assert_eq!(registry.len(), 0);
     }
 
     #[test]
@@ -461,29 +370,26 @@ mod tests {
         registry.register(&config1);
         registry.register(&config2);
 
-        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.stats().total, 2);
     }
 
     #[test]
     fn test_is_available_default() {
         let registry = create_test_registry();
 
-        // Unknown instances are available by default
-        assert!(registry.is_available("nonexistent:3306"));
-
         let config = create_test_config("localhost", 3306);
         let health = registry.register(&config);
 
         // Newly registered (Unknown status) is available
-        assert!(registry.is_available("localhost:3306"));
+        assert!(health.read().is_available());
 
         // Make it healthy (need enough successes for sliding window)
         // Default window: min_samples=3, healthy_threshold=5
         for _ in 0..5 {
             health.write().record_success(None);
         }
-        assert!(registry.is_available("localhost:3306"));
-        assert!(registry.is_healthy("localhost:3306"));
+        assert!(health.read().is_available());
+        assert!(health.read().is_healthy());
     }
 
     #[test]

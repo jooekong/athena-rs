@@ -189,9 +189,9 @@ Session 使用对应的 PoolManager 和 Router
 
 **Session 集成：**
 ```rust
-// Session 根据 username 选择 Group
-fn select_group(&mut self, username: &str) -> Result<(), SessionError> {
-    let ctx = self.group_manager.get_for_user(username)?;
+// Session 根据 database 选择 Group
+fn select_group(&mut self, database: &str) -> Result<(), SessionError> {
+    let ctx = self.group_manager.get_by_database(database)?;
     self.pool_manager = ctx.pool_manager.clone();
     self.router = Router::new(ctx.router_config.clone());
     Ok(())
@@ -206,30 +206,18 @@ fn select_group(&mut self, username: &str) -> Result<(), SessionError> {
 - 事务内所有查询 → Master（保证事务一致性）
 - 非查询命令（PING、InitDb）→ Master
 
-**实例选择策略 (`src/router/selector.rs`)：**
-```rust
-/// 可扩展的实例选择策略
-pub trait InstanceSelector: Send + Sync {
-    fn select<'a>(&self, instances: &[&'a DBInstanceConfig]) -> Option<&'a DBInstanceConfig>;
-}
-
-// 内置策略
-pub struct FirstSelector;        // 选第一个（默认主库策略）
-pub struct RoundRobinSelector;   // 轮询（默认从库策略）
-```
-
-**Fallback 机制：**
-- 无从库时自动 fallback 到主库
-- `select_with_target()` 返回实际使用的 target
+**实例选择策略：**
+- 主库：固定使用第一个 master（配置顺序）
+- 从库：轮询选择；无从库时 fallback 到主库
 
 **多主多从支持：**
 ```
 DBGroup
-├── Master 1 (primary, FirstSelector 默认选中)
+├── Master 1 (primary)
 ├── Master 2
-├── Slave 1 ──┐
-├── Slave 2 ──┼── RoundRobinSelector 轮询
-└── Slave 3 ──┘
+├── Slave 1
+├── Slave 2
+└── Slave 3
 ```
 
 ### 连接污染防护

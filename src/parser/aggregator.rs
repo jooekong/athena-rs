@@ -5,9 +5,8 @@
 //! - Merging aggregate results (COUNT, SUM, MAX, MIN, AVG) from multiple shards
 //! - Building merged result packets to return to client
 
-use bytes::{BufMut, Bytes, BytesMut};
-use std::cmp::Ordering;
-use tracing::debug;
+use bytes::Bytes;
+
 
 use super::analyzer::{AggregateInfo, AggregateType};
 
@@ -292,61 +291,6 @@ fn read_length_encoded_int(data: &[u8]) -> (u64, usize) {
     }
 }
 
-/// Build a MySQL row packet from aggregate values
-pub fn build_row_packet(values: &[AggregateValue], sequence_id: u8) -> Bytes {
-    let mut payload = BytesMut::new();
-
-    for value in values {
-        match value {
-            AggregateValue::Null => {
-                payload.put_u8(0xFB); // NULL indicator
-            }
-            _ => {
-                let encoded = value.encode();
-                // Write length-encoded string
-                write_length_encoded_string(&mut payload, &encoded);
-            }
-        }
-    }
-
-    // Build packet with header
-    let payload_len = payload.len();
-    let mut packet = BytesMut::with_capacity(4 + payload_len);
-    
-    // 3-byte payload length (little-endian)
-    packet.put_u8((payload_len & 0xFF) as u8);
-    packet.put_u8(((payload_len >> 8) & 0xFF) as u8);
-    packet.put_u8(((payload_len >> 16) & 0xFF) as u8);
-    // Sequence ID
-    packet.put_u8(sequence_id);
-    // Payload
-    packet.extend(payload);
-
-    packet.freeze()
-}
-
-/// Write a length-encoded string to buffer
-fn write_length_encoded_string(buf: &mut BytesMut, data: &[u8]) {
-    let len = data.len();
-    
-    if len < 251 {
-        buf.put_u8(len as u8);
-    } else if len < 65536 {
-        buf.put_u8(0xFC);
-        buf.put_u16_le(len as u16);
-    } else if len < 16777216 {
-        buf.put_u8(0xFD);
-        buf.put_u8((len & 0xFF) as u8);
-        buf.put_u8(((len >> 8) & 0xFF) as u8);
-        buf.put_u8(((len >> 16) & 0xFF) as u8);
-    } else {
-        buf.put_u8(0xFE);
-        buf.put_u64_le(len as u64);
-    }
-    
-    buf.extend_from_slice(data);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,8 +316,6 @@ mod tests {
         let info = AggregateInfo {
             func_type: AggregateType::Count,
             position: 0,
-            expr_str: "COUNT(*)".to_string(),
-            is_count_star: true,
         };
         
         let mut merger = AggregateMerger::new(info);
@@ -390,8 +332,6 @@ mod tests {
         let info = AggregateInfo {
             func_type: AggregateType::Sum,
             position: 0,
-            expr_str: "SUM(amount)".to_string(),
-            is_count_star: false,
         };
         
         let mut merger = AggregateMerger::new(info);
@@ -412,8 +352,6 @@ mod tests {
         let info = AggregateInfo {
             func_type: AggregateType::Max,
             position: 0,
-            expr_str: "MAX(amount)".to_string(),
-            is_count_star: false,
         };
         
         let mut merger = AggregateMerger::new(info);
@@ -430,8 +368,6 @@ mod tests {
         let info = AggregateInfo {
             func_type: AggregateType::Min,
             position: 0,
-            expr_str: "MIN(amount)".to_string(),
-            is_count_star: false,
         };
         
         let mut merger = AggregateMerger::new(info);

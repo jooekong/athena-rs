@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::config::BackendConfig;
 
@@ -93,15 +93,6 @@ impl TransactionPool {
         Ok(())
     }
 
-    /// Access the bound connection mutably
-    pub async fn with_connection<F, R>(&self, session_id: u32, f: F) -> Option<R>
-    where
-        F: FnOnce(&mut PooledConnection) -> R,
-    {
-        let mut bound = self.bound.lock().await;
-        bound.get_mut(&session_id).map(f)
-    }
-
     /// Release the bound connection for a session
     ///
     /// For normally committed/rolled-back transactions, the connection is clean
@@ -126,24 +117,6 @@ impl TransactionPool {
             }
             // Abnormal exit or failed to restore autocommit - discard connection
             debug!(session_id, transaction_completed, "Discarding transaction connection");
-        }
-    }
-
-    /// Check if a session has a bound connection
-    pub async fn has_bound(&self, session_id: u32) -> bool {
-        self.bound.lock().await.contains_key(&session_id)
-    }
-
-    /// Get number of bound connections
-    pub async fn bound_count(&self) -> usize {
-        self.bound.lock().await.len()
-    }
-
-    /// Force remove a session's connection (e.g., on session close)
-    pub async fn force_release(&self, session_id: u32) {
-        let mut bound = self.bound.lock().await;
-        if bound.remove(&session_id).is_some() {
-            debug!(session_id = session_id, "Force released bound connection");
         }
     }
 

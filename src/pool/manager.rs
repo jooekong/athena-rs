@@ -241,12 +241,13 @@ impl PoolManager {
 
     /// Get a master connection
     pub async fn get_master(&self, group_id: &DbGroupId) -> Result<PooledConnection, ConnectionError> {
-        let pool = match group_id {
-            DbGroupId::Shard(index) => {
-                let pools = self.shard_master_pools.read().await;
-                pools.get(*index).cloned().or_else(|| None)
-            }
-            DbGroupId::Home => self.home_master_pool.read().await.clone(),
+        let pool = if group_id.is_home() {
+            self.home_master_pool.read().await.clone()
+        } else if let Some(index) = group_id.shard_index() {
+            let pools = self.shard_master_pools.read().await;
+            pools.get(index).cloned().or_else(|| None)
+        } else {
+            None
         };
 
         // Fallback to home if shard not found
@@ -255,7 +256,7 @@ impl PoolManager {
             None
         });
 
-        let pool = if pool.is_none() && matches!(group_id, DbGroupId::Shard(_)) {
+        let pool = if pool.is_none() && group_id.is_shard() {
             self.home_master_pool.read().await.clone()
         } else {
             pool
@@ -266,15 +267,14 @@ impl PoolManager {
 
     /// Get a slave connection (round-robin, falls back to master)
     pub async fn get_slave(&self, group_id: &DbGroupId) -> Result<PooledConnection, ConnectionError> {
-        let pool = match group_id {
-            DbGroupId::Shard(index) => {
-                let slaves = self.shard_slave_pools.read().await;
-                slaves.get(*index).and_then(|g| g.as_ref()).and_then(|g| g.select())
-            }
-            DbGroupId::Home => {
-                let slave_group = self.home_slave_pool.read().await;
-                slave_group.as_ref().and_then(|g| g.select())
-            }
+        let pool = if group_id.is_home() {
+            let slave_group = self.home_slave_pool.read().await;
+            slave_group.as_ref().and_then(|g| g.select())
+        } else if let Some(index) = group_id.shard_index() {
+            let slaves = self.shard_slave_pools.read().await;
+            slaves.get(index).and_then(|g| g.as_ref()).and_then(|g| g.select())
+        } else {
+            None
         };
 
         if let Some(pool) = pool {
@@ -286,17 +286,14 @@ impl PoolManager {
 
     /// Return a master connection
     pub async fn put_master(&self, group_id: &DbGroupId, conn: PooledConnection) {
-        match group_id {
-            DbGroupId::Shard(index) => {
-                let pools = self.shard_master_pools.read().await;
-                if let Some(pool) = pools.get(*index) {
-                    pool.put(conn).await;
-                }
+        if group_id.is_home() {
+            if let Some(pool) = self.home_master_pool.read().await.as_ref() {
+                pool.put(conn).await;
             }
-            DbGroupId::Home => {
-                if let Some(pool) = self.home_master_pool.read().await.as_ref() {
-                    pool.put(conn).await;
-                }
+        } else if let Some(index) = group_id.shard_index() {
+            let pools = self.shard_master_pools.read().await;
+            if let Some(pool) = pools.get(index) {
+                pool.put(conn).await;
             }
         }
     }
@@ -305,15 +302,14 @@ impl PoolManager {
     pub async fn put_slave(&self, group_id: &DbGroupId, conn: PooledConnection) {
         let conn_addr = conn.backend_addr().to_string();
 
-        let matching_pool = match group_id {
-            DbGroupId::Shard(index) => {
-                let slaves = self.shard_slave_pools.read().await;
-                slaves.get(*index).and_then(|g| g.as_ref()).and_then(|g| g.find_by_addr(&conn_addr))
-            }
-            DbGroupId::Home => {
-                let slave_group = self.home_slave_pool.read().await;
-                slave_group.as_ref().and_then(|g| g.find_by_addr(&conn_addr))
-            }
+        let matching_pool = if group_id.is_home() {
+            let slave_group = self.home_slave_pool.read().await;
+            slave_group.as_ref().and_then(|g| g.find_by_addr(&conn_addr))
+        } else if let Some(index) = group_id.shard_index() {
+            let slaves = self.shard_slave_pools.read().await;
+            slaves.get(index).and_then(|g| g.as_ref()).and_then(|g| g.find_by_addr(&conn_addr))
+        } else {
+            None
         };
 
         if let Some(pool) = matching_pool {
@@ -355,12 +351,13 @@ impl PoolManager {
         group_id: &DbGroupId,
         database: Option<String>,
     ) -> Result<(), ConnectionError> {
-        let backend = match group_id {
-            DbGroupId::Shard(index) => {
-                let backends = self.shard_backends.read().await;
-                backends.get(*index).cloned()
-            }
-            DbGroupId::Home => self.home_backend.read().await.clone(),
+        let backend = if group_id.is_home() {
+            self.home_backend.read().await.clone()
+        } else if let Some(index) = group_id.shard_index() {
+            let backends = self.shard_backends.read().await;
+            backends.get(index).cloned()
+        } else {
+            None
         };
 
         let backend = backend.ok_or(ConnectionError::Disconnected)?;
@@ -376,12 +373,12 @@ impl PoolManager {
         group_id: Option<&DbGroupId>,
         transaction_completed: bool,
     ) {
-        let pool = match group_id {
-            Some(DbGroupId::Shard(index)) => {
+        let pool = match group_id.and_then(|id| id.shard_index()) {
+            Some(index) => {
                 let pools = self.shard_master_pools.read().await;
-                pools.get(*index).cloned()
+                pools.get(index).cloned()
             }
-            Some(DbGroupId::Home) | None => self.home_master_pool.read().await.clone(),
+            None => self.home_master_pool.read().await.clone(),
         };
 
         self.transaction_pool
@@ -394,8 +391,4 @@ impl PoolManager {
         &self.transaction_pool
     }
 
-    /// Get shard count
-    pub async fn shard_count(&self) -> usize {
-        self.shard_master_pools.read().await.len()
-    }
 }

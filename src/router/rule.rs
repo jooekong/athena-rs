@@ -103,15 +103,7 @@ impl RouterConfig {
         self.calculators.get(key.as_ref())
     }
 
-    /// Check if a table is sharded
-    pub fn is_sharded(&self, table_name: &str) -> bool {
-        self.find_rule(table_name).is_some()
-    }
-
-    /// Get all rules
-    pub fn rules(&self) -> impl Iterator<Item = &ShardingRule> {
-        self.rules.values()
-    }
+    // Intentionally no public rule enumeration helpers yet.
 }
 
 #[cfg(test)]
@@ -149,14 +141,14 @@ mod tests {
             range_boundaries: vec![],
         });
 
-        assert!(config.is_sharded("users"));
-        assert!(config.is_sharded("USERS"));
-        assert!(!config.is_sharded("orders"));
+        assert!(config.find_rule("users").is_some());
+        assert!(config.find_rule("USERS").is_some());
+        assert!(config.find_rule("orders").is_none());
 
         let rule = config.find_rule("users").unwrap();
         assert_eq!(rule.shard_column, "user_id");
 
         let calc = config.find_calculator("users").unwrap();
-        assert_eq!(calc.shard_count(), 16);
+        assert_eq!(calc.all_shards().len(), 16);
     }
 }

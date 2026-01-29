@@ -30,12 +30,6 @@ pub struct GroupContext {
 }
 
 impl GroupContext {
-    /// Validate proxy-level authentication
-    ///
-    /// Returns true if username and password match the group's auth config
-    pub fn validate_auth(&self, username: &str, password: &str) -> bool {
-        self.auth_user == username && self.auth_password == password
-    }
 }
 
 /// Manages all groups and their resources
@@ -161,6 +155,7 @@ impl GroupManager {
                     addr = %inst.addr(),
                     role = ?inst.role,
                     db_group = %db_group.name,
+                    limiter = ?inst.limiter,
                     "Registered instance for health checks"
                 );
             }
@@ -195,6 +190,9 @@ impl GroupManager {
     fn build_db_group_backend(db_group: &DBGroupConfig) -> DbGroupBackend {
         let masters: Vec<&DBInstanceConfig> = db_group.masters();
         let slaves: Vec<&DBInstanceConfig> = db_group.slaves();
+        if !db_group.has_slaves() {
+            debug!(db_group = %db_group.name, "No slave instances configured");
+        }
 
         let master = masters
             .first()
@@ -228,13 +226,6 @@ impl GroupManager {
     /// Group name = database name (client connects with database that maps to group)
     pub fn get_by_database(&self, database: &str) -> Option<Arc<GroupContext>> {
         self.get(database)
-    }
-
-    /// Get group for a username
-    ///
-    /// Username maps 1:1 to group name.
-    pub fn get_for_user(&self, username: &str) -> Option<Arc<GroupContext>> {
-        self.get(username)
     }
 
     /// Get the shared health registry

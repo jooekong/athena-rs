@@ -6,13 +6,8 @@
 //! - Multi-tenant deduplication (shared heartbeat for same host:port)
 //! - Master/Slave role detection
 
-mod checker;
 mod master;
 mod registry;
 mod state;
 
-pub use checker::{CheckError, HealthChecker};
-pub use crate::config::HealthCheckConfig;
-pub use master::{DetectError, MasterDetector};
-pub use registry::{InstanceRegistry, RegistryStats};
-pub use state::{CheckResult, HealthStatus, InstanceHealth, WindowConfig};
+pub use registry::InstanceRegistry;

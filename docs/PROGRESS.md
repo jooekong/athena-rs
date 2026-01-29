@@ -267,7 +267,6 @@ done
 - [x] 创建 `src/metrics/mod.rs` 模块
 - [x] 连接指标：`athena_connections_total/active/closed`
 - [x] 查询指标：`athena_queries_total`、`athena_query_duration_seconds`、`athena_query_errors_total`
-- [x] 连接池指标：`athena_pool_idle_connections`、`athena_pool_active_connections`
 - [x] 限流指标：`athena_rate_limit_acquired/rejected_*`
 - [x] 路由指标：`athena_queries_routed_total`、`athena_scatter_queries_total`
 - [x] HTTP 端点：`:PORT+1000` (`/metrics`, `/health`)
@@ -300,7 +299,6 @@ done
 
 **新增测试：**
 - `test_zero_queue_size_first_acquire_succeeds` - 验证 queue_size=0 时首次获取成功
-- `test_fast_path_no_queue_increment` - 验证快速路径不增加等待计数
 
 **集成测试框架：**
 - [x] 创建 `tests/integration/` 目录结构
@@ -361,20 +359,13 @@ max_queue_size = 50
 - [x] `DBGroupConfig` 添加 `masters()`、`slaves()`、`primary_master()` 方法
 - [x] `has_slaves()` 方法用于检查是否有从库
 
-#### 9.2 实例选择策略
-- [x] `InstanceSelector` trait：可扩展的选择策略接口
-- [x] `FirstSelector`：选择第一个实例（默认主库策略）
-- [x] `RoundRobinSelector`：轮询选择（默认从库策略）
-- [x] `ReadWriteRouter`：读写路由器，支持 fallback
-
-#### 9.3 连接污染防护
+#### 9.2 连接污染防护
 - [x] `SessionState.session_vars`：存储拦截的 SET 变量
 - [x] SET 命令解析：支持多种格式（`SET var=val`、`SET NAMES`、`SET @@session.var`）
 - [x] 事务关键命令例外：`SET autocommit`、`SET TRANSACTION` 在事务中转发
 
 **文件变更：**
 - `src/config/schema.rs` - DBGroupConfig helper 方法
-- `src/router/selector.rs` - 新增：实例选择策略
 - `src/session/state.rs` - session_vars 字段
 - `src/session/mod.rs` - SET 命令拦截逻辑
 
@@ -396,7 +387,6 @@ max_queue_size = 50
 #### 10.2 实例注册表（多租户去重）
 - [x] `InstanceRegistry` - 按 host:port 去重
 - [x] 引用计数，支持多 Group 共享同一实例
-- [x] `is_healthy()` / `is_available()` 状态查询
 
 #### 10.3 Master 检测
 - [x] `MasterDetector` - 检测实例角色
@@ -426,8 +416,6 @@ max_queue_size = 50
 - `src/health/state.rs` - InstanceHealth, HealthStatus
 - `src/health/registry.rs` - InstanceRegistry（去重）
 - `src/health/master.rs` - MasterDetector（角色检测）
-- `src/health/checker.rs` - HealthChecker（后台任务）
-- `src/router/selector.rs` - 健康实例选择方法
 - `src/config/schema.rs` - HealthCheckConfig
 
 ---
@@ -441,12 +429,12 @@ max_queue_size = 50
 #### 11.1 GroupManager 模块
 - [x] `GroupManager` - 管理所有 Group 及其运行时资源
 - [x] `GroupContext` - 单个 Group 的运行时上下文
-- [x] 按 username 查找 Group（1:1 映射）
+- [x] 按 database 名称查找 Group（1:1 映射）
 - [x] 共享 HealthRegistry 跨所有 Group
 
 #### 11.2 Session 集成
 - [x] Session 支持两种模式：Legacy（直接 PoolManager）和 Groups（GroupManager）
-- [x] Handshake 完成后根据 username 选择 GroupContext
+- [x] Handshake 完成后根据 database 选择 GroupContext
 - [x] 动态设置 pool_manager 和 router
 
 #### 11.3 健康检查集成
@@ -554,8 +542,7 @@ athena-rs/
 │   │   ├── mod.rs
 │   │   ├── shard.rs
 │   │   ├── rule.rs
-│   │   ├── rw_split.rs
-│   │   └── selector.rs          # 实例选择策略（读写分离）
+│   │   └── rw_split.rs
 │   ├── pool/
 │   │   ├── mod.rs
 │   │   ├── connection.rs       # 包含 backend_addr 追踪
@@ -569,8 +556,7 @@ athena-rs/
 │   │   ├── mod.rs              # 健康检查模块入口
 │   │   ├── state.rs            # InstanceHealth, HealthStatus
 │   │   ├── registry.rs         # InstanceRegistry（多租户去重）
-│   │   ├── master.rs           # MasterDetector（角色检测）
-│   │   └── checker.rs          # HealthChecker（后台任务）
+│   │   └── master.rs           # MasterDetector（角色检测）
 │   ├── metrics/
 │   │   └── mod.rs              # Prometheus 指标 + HTTP 端点
 │   └── session/

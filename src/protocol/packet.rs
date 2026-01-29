@@ -2,9 +2,6 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// MySQL packet header size: 3 bytes length + 1 byte sequence
 pub const PACKET_HEADER_SIZE: usize = 4;
-/// Maximum packet payload size (16MB - 1)
-pub const MAX_PACKET_SIZE: usize = 0xFF_FF_FF;
-
 /// MySQL wire protocol packet
 #[derive(Debug, Clone)]
 pub struct Packet {

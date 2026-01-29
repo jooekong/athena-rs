@@ -133,12 +133,6 @@ impl ShardCalculator {
         shards
     }
 
-    /// Calculate all shard indices for a list of i64 values (convenience method)
-    pub fn calculate_all_i64(&self, values: &[i64]) -> Vec<usize> {
-        let shard_values: Vec<ShardValue> = values.iter().map(|v| ShardValue::Integer(*v)).collect();
-        self.calculate_all(&shard_values)
-    }
-
     /// Calculate shard indices for a range of integer values
     pub fn calculate_range_values(&self, start: i64, end: i64) -> Vec<usize> {
         match self.algorithm {
@@ -170,11 +164,6 @@ impl ShardCalculator {
     /// Get all shard indices (for full table scan)
     pub fn all_shards(&self) -> Vec<usize> {
         (0..self.shard_count).collect()
-    }
-
-    /// Get shard count
-    pub fn shard_count(&self) -> usize {
-        self.shard_count
     }
 
     fn calculate_range_int(&self, value: i64) -> usize {

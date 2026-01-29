@@ -3,8 +3,7 @@
 //! Exposes metrics via HTTP endpoint for Prometheus scraping.
 
 use prometheus::{
-    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter,
-    IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
 use std::sync::OnceLock;
 
@@ -36,16 +35,6 @@ pub struct Metrics {
     pub query_duration_seconds: HistogramVec,
     /// Query errors by type
     pub query_errors_total: IntCounterVec,
-
-    // Pool metrics
-    /// Idle connections in pool by shard
-    pub pool_idle_connections: IntGaugeVec,
-    /// Active connections from pool by shard
-    pub pool_active_connections: IntGaugeVec,
-    /// Connection pool get operations
-    pub pool_gets_total: IntCounterVec,
-    /// Connection pool put operations
-    pub pool_puts_total: IntCounterVec,
 
     // Rate limiting metrics
     /// Rate limit permits acquired
@@ -115,43 +104,6 @@ impl Metrics {
         let query_errors_total = IntCounterVec::new(
             Opts::new("athena_query_errors_total", "Total number of query errors"),
             &["type"], // parse_error, backend_error, timeout, etc.
-        )
-        .unwrap();
-
-        // Pool metrics
-        let pool_idle_connections = IntGaugeVec::new(
-            Opts::new(
-                "athena_pool_idle_connections",
-                "Number of idle connections in pool",
-            ),
-            &["shard", "role"], // role: master/slave
-        )
-        .unwrap();
-
-        let pool_active_connections = IntGaugeVec::new(
-            Opts::new(
-                "athena_pool_active_connections",
-                "Number of active connections from pool",
-            ),
-            &["shard", "role"],
-        )
-        .unwrap();
-
-        let pool_gets_total = IntCounterVec::new(
-            Opts::new(
-                "athena_pool_gets_total",
-                "Total number of connection pool get operations",
-            ),
-            &["shard", "role"],
-        )
-        .unwrap();
-
-        let pool_puts_total = IntCounterVec::new(
-            Opts::new(
-                "athena_pool_puts_total",
-                "Total number of connection pool put operations",
-            ),
-            &["shard", "role"],
         )
         .unwrap();
 
@@ -238,18 +190,6 @@ impl Metrics {
             .register(Box::new(query_errors_total.clone()))
             .unwrap();
         registry
-            .register(Box::new(pool_idle_connections.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(pool_active_connections.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(pool_gets_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(pool_puts_total.clone()))
-            .unwrap();
-        registry
             .register(Box::new(rate_limit_acquired_total.clone()))
             .unwrap();
         registry
@@ -279,10 +219,6 @@ impl Metrics {
             queries_total,
             query_duration_seconds,
             query_errors_total,
-            pool_idle_connections,
-            pool_active_connections,
-            pool_gets_total,
-            pool_puts_total,
             rate_limit_acquired_total,
             rate_limit_rejected_queue_full,
             rate_limit_rejected_timeout,

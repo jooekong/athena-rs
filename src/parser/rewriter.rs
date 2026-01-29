@@ -188,22 +188,6 @@ impl SqlRewriter {
         format!("{}_{}", logical_name, shard_index)
     }
 
-    /// Generate physical table name with custom suffix pattern
-    ///
-    /// # Arguments
-    /// * `logical_name` - Logical table name
-    /// * `shard_index` - Shard index
-    /// * `pad_width` - Zero-padding width (e.g., 4 for 0001, 0002, ...)
-    ///
-    /// # Examples
-    /// - `users`, 3, 4 -> `users_0003`
-    pub fn generate_physical_table_name_padded(
-        logical_name: &str,
-        shard_index: usize,
-        pad_width: usize,
-    ) -> String {
-        format!("{}_{:0>width$}", logical_name, shard_index, width = pad_width)
-    }
 }
 
 /// Check if a byte is a valid identifier character
@@ -268,18 +252,6 @@ mod tests {
         assert_eq!(
             SqlRewriter::generate_physical_table_name("order", 15),
             "order_15"
-        );
-    }
-
-    #[test]
-    fn test_generate_physical_table_name_padded() {
-        assert_eq!(
-            SqlRewriter::generate_physical_table_name_padded("users", 3, 4),
-            "users_0003"
-        );
-        assert_eq!(
-            SqlRewriter::generate_physical_table_name_padded("users", 123, 4),
-            "users_0123"
         );
     }
 

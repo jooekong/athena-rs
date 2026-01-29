@@ -25,32 +25,6 @@ pub enum DetectError {
 pub struct MasterDetector;
 
 impl MasterDetector {
-    /// Detect the role of a MySQL instance
-    ///
-    /// Returns Master if:
-    /// - @@read_only = 0 AND
-    /// - SHOW SLAVE STATUS returns empty result
-    ///
-    /// Returns Slave otherwise.
-    pub async fn detect_role(conn: &mut PooledConnection) -> Result<DBInstanceRole, DetectError> {
-        // Check read_only first (faster)
-        let read_only = Self::query_read_only(conn).await?;
-        if read_only {
-            debug!("Instance is read_only=1, detected as Slave");
-            return Ok(DBInstanceRole::Slave);
-        }
-
-        // Check slave status
-        let is_slave = Self::has_slave_status(conn).await?;
-        if is_slave {
-            debug!("Instance has slave status, detected as Slave");
-            return Ok(DBInstanceRole::Slave);
-        }
-
-        debug!("Instance is read_only=0 and no slave status, detected as Master");
-        Ok(DBInstanceRole::Master)
-    }
-
     /// Combined ping and role detection
     ///
     /// Uses `SELECT 1, @@read_only` to verify connection and get read_only status
@@ -83,12 +57,6 @@ impl MasterDetector {
         Ok(DBInstanceRole::Master)
     }
 
-    /// Check if this instance is a master
-    pub async fn is_master(conn: &mut PooledConnection) -> Result<bool, DetectError> {
-        let role = Self::detect_role(conn).await?;
-        Ok(role == DBInstanceRole::Master)
-    }
-
     /// Combined ping and read_only query
     ///
     /// Returns true if read_only=1 (slave), false if read_only=0 (master)
@@ -98,24 +66,6 @@ impl MasterDetector {
 
         // First value is "1" (ping), second is read_only
         match result.1.as_str() {
-            "0" => Ok(false),
-            "1" => Ok(true),
-            other => {
-                debug!(value = %other, "Unexpected read_only value, assuming slave");
-                Ok(true)
-            }
-        }
-    }
-
-    /// Query @@read_only variable
-    ///
-    /// Returns true if read_only=1 (slave), false if read_only=0 (master)
-    async fn query_read_only(conn: &mut PooledConnection) -> Result<bool, DetectError> {
-        let sql = "SELECT @@read_only";
-        let result = Self::query_single_value(conn, sql).await?;
-
-        // Parse result: "0" or "1"
-        match result.as_str() {
             "0" => Ok(false),
             "1" => Ok(true),
             other => {
@@ -196,73 +146,6 @@ impl MasterDetector {
         Self::drain_result_set(conn).await?;
 
         Ok((val1, val2))
-    }
-
-    /// Execute a query and return the first column of the first row
-    async fn query_single_value(
-        conn: &mut PooledConnection,
-        sql: &str,
-    ) -> Result<String, DetectError> {
-        // Send query
-        let mut payload = vec![0x03]; // COM_QUERY
-        payload.extend_from_slice(sql.as_bytes());
-        let packet = Packet::new(0, payload);
-
-        conn.send(packet)
-            .await
-            .map_err(|e| DetectError::Connection(e.to_string()))?;
-
-        // Read first response packet
-        let first = conn
-            .recv()
-            .await
-            .map_err(|_| DetectError::Connection("Disconnected".into()))?;
-
-        if is_err_packet(&first.payload) {
-            return Err(DetectError::Query(format!(
-                "Query failed: {}",
-                String::from_utf8_lossy(&first.payload[9..])
-            )));
-        }
-
-        if is_ok_packet(&first.payload) {
-            // No result set (shouldn't happen for SELECT)
-            return Err(DetectError::Parse("Expected result set, got OK".into()));
-        }
-
-        // First packet is column count, skip it
-        // Read column definition
-        let _col_def = conn
-            .recv()
-            .await
-            .map_err(|_| DetectError::Connection("Disconnected".into()))?;
-
-        // Read EOF (or next packet in DEPRECATE_EOF mode)
-        let eof_or_row = conn
-            .recv()
-            .await
-            .map_err(|_| DetectError::Connection("Disconnected".into()))?;
-
-        // Check if this is EOF (0xFE with small payload) or a row
-        let is_eof = eof_or_row.payload.first() == Some(&0xFE) && eof_or_row.payload.len() < 9;
-
-        let row_packet = if is_eof {
-            // Read actual row
-            conn.recv()
-                .await
-                .map_err(|_| DetectError::Connection("Disconnected".into()))?
-        } else {
-            // This was the row
-            eof_or_row
-        };
-
-        // Parse row value (length-encoded string)
-        let value = Self::parse_length_encoded_string(&row_packet.payload)?;
-
-        // Consume remaining packets until EOF
-        Self::drain_result_set(conn).await?;
-
-        Ok(value)
     }
 
     /// Execute a query and check if it returns any rows
@@ -360,11 +243,6 @@ impl MasterDetector {
             }
         }
         Ok(())
-    }
-
-    /// Parse a length-encoded string from packet payload
-    fn parse_length_encoded_string(data: &[u8]) -> Result<String, DetectError> {
-        Self::parse_length_encoded_string_with_offset(data).map(|(s, _)| s)
     }
 
     /// Parse a length-encoded string and return the total bytes consumed

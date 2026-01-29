@@ -27,28 +27,13 @@ impl RwSplitter {
             return RouteTarget::Master;
         }
 
-        // Route based on statement type
-        match stmt_type {
-            // Read-only operations can go to slave
-            StatementType::Select | StatementType::Show => RouteTarget::Slave,
-
-            // Write operations must go to master
-            StatementType::Insert
-            | StatementType::Update
-            | StatementType::Delete
-            | StatementType::Begin
-            | StatementType::Commit
-            | StatementType::Rollback => RouteTarget::Master,
-
-            // Other operations go to master for safety
-            StatementType::Set | StatementType::Use | StatementType::Other => RouteTarget::Master,
+        if stmt_type.is_read_only() {
+            return RouteTarget::Slave;
         }
+
+        RouteTarget::Master
     }
 
-    /// Check if a statement should be routed to slave
-    pub fn can_use_slave(stmt_type: StatementType, in_transaction: bool) -> bool {
-        Self::route(stmt_type, in_transaction) == RouteTarget::Slave
-    }
 }
 
 #[cfg(test)]

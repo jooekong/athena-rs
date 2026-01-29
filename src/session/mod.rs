@@ -3,7 +3,7 @@ mod state;
 pub use state::SessionState;
 
 use crate::circuit::{ConcurrencyController, LimitError, LimitKey, LimitPermit};
-use crate::group::{GroupContext, GroupManager};
+use crate::group::GroupManager;
 use crate::metrics::metrics;
 use crate::parser::{
     AggregateInfo, AggregateMerger, AggregateValue, RowParser, SqlAnalysis, SqlAnalyzer,
@@ -14,7 +14,7 @@ use crate::protocol::{
     capabilities, is_eof_packet, is_err_packet, is_ok_packet, ClientCommand, ErrPacket,
     HandshakeResponse, InitialHandshake, OkPacket, Packet, PacketCodec,
 };
-use crate::router::{RouteResult, RouteTarget, Router, RouterConfig};
+use crate::router::{RouteResult, RouteTarget, Router};
 use futures::SinkExt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -55,42 +55,6 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(
-        id: u32,
-        pool_manager: Arc<PoolManager>,
-        concurrency_controller: Arc<ConcurrencyController>,
-    ) -> Self {
-        Self {
-            id,
-            state: SessionState::new(),
-            pool_manager,
-            router: Router::default(),
-            group_manager: None,
-            concurrency_controller,
-            analyzer: SqlAnalyzer::new(),
-            auth_scramble: None,
-        }
-    }
-
-    /// Create session with custom router configuration
-    pub fn with_router(
-        id: u32,
-        pool_manager: Arc<PoolManager>,
-        concurrency_controller: Arc<ConcurrencyController>,
-        router_config: RouterConfig,
-    ) -> Self {
-        Self {
-            id,
-            state: SessionState::new(),
-            pool_manager,
-            router: Router::new(router_config),
-            group_manager: None,
-            concurrency_controller,
-            analyzer: SqlAnalyzer::new(),
-            auth_scramble: None,
-        }
-    }
-
     /// Create session with group manager (groups-only mode)
     ///
     /// Pool manager and router will be set after handshake based on database.
@@ -276,7 +240,29 @@ impl Session {
             };
 
             let cmd = ClientCommand::parse(&packet.payload);
-            debug!(session_id = self.id, command = ?cmd, "Received command");
+            debug!(
+                session_id = self.id,
+                command = ?cmd,
+                read_only = cmd.is_read_only(),
+                tx_control = cmd.is_transaction_control(),
+                "Received command"
+            );
+            if let ClientCommand::FieldList { table, wildcard } = &cmd {
+                debug!(
+                    session_id = self.id,
+                    table = %table,
+                    wildcard = %wildcard,
+                    "Field list command"
+                );
+            }
+            if let ClientCommand::Unknown(code, payload) = &cmd {
+                debug!(
+                    session_id = self.id,
+                    command_code = *code,
+                    payload_len = payload.len(),
+                    "Unknown client command"
+                );
+            }
 
             // Handle QUIT command
             if matches!(cmd, ClientCommand::Quit) {
@@ -328,7 +314,7 @@ impl Session {
             }
 
             // Non-query commands go to home group
-            let home = DbGroupId::Home;
+            let home = DbGroupId::home();
 
             // Determine if we need transaction connection or stateless connection
             let use_transaction = self.state.in_transaction || cmd.starts_transaction();
@@ -397,6 +383,14 @@ impl Session {
             }
         };
         let parse_elapsed = parse_start.elapsed();
+        let is_tx_control = analysis.stmt_type.is_transaction_control();
+        if is_tx_control {
+            debug!(
+                session_id = self.id,
+                stmt_type = ?analysis.stmt_type,
+                "Transaction control statement"
+            );
+        }
 
         debug!(
             session_id = self.id,
@@ -1343,17 +1337,6 @@ impl Session {
         self.forward_transaction_response_ex(client, single_eof).await
     }
 
-    /// Forward response from transaction connection to client
-    async fn forward_transaction_response<C>(
-        &self,
-        client: &mut Framed<C, PacketCodec>,
-    ) -> Result<(), SessionError>
-    where
-        C: AsyncRead + AsyncWrite + Unpin,
-    {
-        self.forward_transaction_response_ex(client, false).await
-    }
-
     /// Forward response from transaction connection to client (extended version)
     ///
     /// `single_eof` - if true, response has only one EOF (e.g., COM_FIELD_LIST)
@@ -1478,18 +1461,6 @@ impl Session {
         }
 
         result
-    }
-
-    /// Forward response from pooled connection to client
-    async fn forward_pooled_response<C>(
-        &self,
-        client: &mut Framed<C, PacketCodec>,
-        conn: &mut PooledConnection,
-    ) -> Result<(), SessionError>
-    where
-        C: AsyncRead + AsyncWrite + Unpin,
-    {
-        self.forward_pooled_response_ex(client, conn, false).await
     }
 
     /// Forward response from pooled connection to client (extended version)
@@ -1666,9 +1637,6 @@ pub enum SessionError {
 
     #[error("Backend connection failed: {0}")]
     BackendConnect(String),
-
-    #[error("Backend authentication failed: {0}")]
-    BackendAuth(String),
 
     #[error("Pool error: {0}")]
     Pool(#[from] ConnectionError),

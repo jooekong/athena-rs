@@ -1,14 +1,14 @@
 mod rule;
 mod rw_split;
-mod selector;
 mod shard;
 
 pub use rule::{RouterConfig, ShardingRule};
 pub use rw_split::{RouteTarget, RwSplitter};
-pub use selector::{FirstSelector, InstanceSelector, ReadWriteRouter, RoundRobinSelector};
-pub use shard::{ShardAlgorithm, ShardCalculator, ShardValue};
+pub use shard::ShardValue;
 
 use std::collections::HashMap;
+
+use tracing::debug;
 
 use crate::parser::{ShardKeyValue, SqlAnalysis, SqlRewriter};
 use crate::pool::{DbGroupId, ShardIndex};
@@ -31,18 +31,11 @@ impl RouteType {
         matches!(self, RouteType::Home)
     }
 
-    pub fn shard_indices(&self) -> Option<&[ShardIndex]> {
-        match self {
-            RouteType::Shards(indices) => Some(indices),
-            RouteType::Home => None,
-        }
-    }
-
     /// Convert to DbGroupId for single-target routes
     pub fn to_group_id(&self) -> Option<DbGroupId> {
         match self {
-            RouteType::Shards(indices) if indices.len() == 1 => Some(DbGroupId::Shard(indices[0])),
-            RouteType::Home => Some(DbGroupId::Home),
+            RouteType::Shards(indices) if indices.len() == 1 => Some(DbGroupId::shard(indices[0])),
+            RouteType::Home => Some(DbGroupId::home()),
             _ => None,
         }
     }
@@ -50,8 +43,8 @@ impl RouteType {
     /// Get all DbGroupIds for this route
     pub fn to_group_ids(&self) -> Vec<DbGroupId> {
         match self {
-            RouteType::Shards(indices) => indices.iter().map(|&idx| DbGroupId::Shard(idx)).collect(),
-            RouteType::Home => vec![DbGroupId::Home],
+            RouteType::Shards(indices) => indices.iter().map(|&idx| DbGroupId::shard(idx)).collect(),
+            RouteType::Home => vec![DbGroupId::home()],
         }
     }
 }
@@ -78,19 +71,6 @@ impl RouteResult {
     /// Get rewritten SQL by index
     pub fn get_sql(&self, index: usize) -> Option<&str> {
         self.rewritten_sqls.get(index).map(|s| s.as_str())
-    }
-
-    /// Get rewritten SQL for a DbGroupId
-    pub fn get_sql_for_group(&self, group_id: &DbGroupId) -> Option<&str> {
-        match (&self.route_type, group_id) {
-            (RouteType::Home, DbGroupId::Home) => self.rewritten_sqls.first().map(|s| s.as_str()),
-            (RouteType::Shards(indices), DbGroupId::Shard(idx)) => {
-                indices.iter().position(|&i| i == *idx)
-                    .and_then(|pos| self.rewritten_sqls.get(pos))
-                    .map(|s| s.as_str())
-            }
-            _ => None,
-        }
     }
 
     /// Check if this is a scatter query
@@ -133,6 +113,12 @@ impl Router {
         for table in &analysis.tables {
             if let Some(rule) = self.config.find_rule(table) {
                 table_to_rule.insert(table.as_str(), rule);
+                debug!(
+                    table = %table,
+                    rule = %rule.name,
+                    matches = rule.matches_table(table),
+                    "Matched sharding rule"
+                );
 
                 let shard_value = analysis
                     .shard_keys
@@ -146,7 +132,7 @@ impl Router {
                     Some(ShardKeyValue::Single(v)) => vec![calc.calculate(v)],
                     Some(ShardKeyValue::Multiple(values)) => calc.calculate_all(values),
                     Some(ShardKeyValue::Range { start, end }) => calc.calculate_range_values(*start, *end),
-                    Some(ShardKeyValue::Unknown) | None => calc.all_shards(),
+                    None => calc.all_shards(),
                 };
 
                 // Intersect with existing shards
@@ -208,13 +194,6 @@ impl Router {
         }
     }
 
-    pub fn add_rule(&mut self, rule: ShardingRule) {
-        self.config.add_rule(rule);
-    }
-
-    pub fn is_sharded(&self, table_name: &str) -> bool {
-        self.config.is_sharded(table_name)
-    }
 }
 
 impl Default for Router {
@@ -227,6 +206,7 @@ impl Default for Router {
 mod tests {
     use super::*;
     use crate::parser::SqlAnalyzer;
+    use super::shard::{ShardAlgorithm, ShardCalculator};
 
     fn setup_router() -> Router {
         let mut config = RouterConfig::new();

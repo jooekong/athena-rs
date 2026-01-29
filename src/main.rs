@@ -43,6 +43,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let config = load_or_default_config();
+    if !config.sharding.is_empty() {
+        warn!(
+            legacy_rule_count = config.sharding.len(),
+            "Legacy sharding rules are ignored; use groups.sharding_rules instead"
+        );
+    }
 
     // Create group manager (groups are required)
     let group_manager = Arc::new(GroupManager::new(&config).await);
@@ -50,6 +56,30 @@ async fn main() -> anyhow::Result<()> {
         groups = ?group_manager.group_names(),
         "Groups configured"
     );
+
+    let health_registry = group_manager.health_registry();
+    let stats = health_registry.stats();
+    if stats.total == 0 {
+        info!("No instances registered for health checks");
+    }
+    metrics::metrics().set_health_instances(
+        stats.healthy as i64,
+        stats.unhealthy as i64,
+        stats.unknown as i64,
+    );
+    let health_registry_for_metrics = health_registry.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            ticker.tick().await;
+            let stats = health_registry_for_metrics.stats();
+            metrics::metrics().set_health_instances(
+                stats.healthy as i64,
+                stats.unhealthy as i64,
+                stats.unknown as i64,
+            );
+        }
+    });
 
     // Create concurrency controller for rate limiting (legacy, will migrate to per-instance)
     let limit_config = LimitConfig::from(&config.circuit);

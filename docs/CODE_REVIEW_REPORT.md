@@ -205,25 +205,6 @@ pub struct SqlAnalyzer {
 **建议**:
 添加指数退避重试机制。
 
-### 3.5 [低] Round-Robin 选择器计数器溢出
-
-**位置**: `src/router/selector.rs:48`
-
-**问题描述**:
-```rust
-let idx = self.counter.fetch_add(1, Ordering::Relaxed) % instances.len();
-```
-
-虽然 `usize` 溢出后会 wrap around，但这是 Rust 的 undefined behavior（在 debug 模式下会 panic）。
-
-**建议**:
-使用 `wrapping_add`:
-```rust
-let idx = self.counter.fetch_add(1, Ordering::Relaxed).wrapping_rem(instances.len());
-```
-
----
-
 ## 4. 代码质量问题
 
 ### 4.1 [高] Legacy ConcurrencyController 存在 Bug

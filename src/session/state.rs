@@ -51,18 +51,9 @@ impl SessionState {
         self.transaction_target = None;
     }
 
-    /// Change current database
-    pub fn change_database(&mut self, db: String) {
-        self.database = Some(db);
-    }
-
     /// Set a session variable (intercepted, not sent to backend)
     pub fn set_session_var(&mut self, name: String, value: String) {
         self.session_vars.insert(name.to_lowercase(), value);
     }
 
-    /// Get a session variable
-    pub fn get_session_var(&self, name: &str) -> Option<&String> {
-        self.session_vars.get(&name.to_lowercase())
-    }
 }
