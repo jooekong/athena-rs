@@ -470,6 +470,63 @@ max_queue_size = 50
 
 ---
 
+### Phase 12: 集成测试完善 ✅ 完成
+
+**目标：** 添加可运行的集成测试覆盖分片、读写分离、跨片事务等场景
+
+**完成内容：**
+
+#### 12.1 测试基础设施
+- [x] 添加 `mysql` crate 作为 dev-dependency
+- [x] 通用测试工具（`tests/integration/main.rs`）
+  - `get_proxy_config()` - 代理连接配置
+  - `calculate_shard()` - 分片哈希计算（与生产代码一致）
+  - `find_different_shard_user_ids()` - 查找不同分片的测试 user_id
+  - `assert_mysql_error()` / `assert_query_error()` - MySQL 错误断言
+  - `skip_if_not_enabled!` 宏 - 跳过未启用的测试
+
+#### 12.2 分片测试（`tests/integration/sharding.rs`）
+- [x] 正常场景
+  - 带分片键的单分片查询
+  - INSERT/UPDATE/DELETE 路由到正确分片
+- [x] JOIN 场景
+  - 同分片键 JOIN 成功
+  - 不同分片键 JOIN 返回 "Empty shard intersection" 错误
+- [x] 异常场景
+  - 无分片键的 UPDATE/DELETE 返回 "Scatter writes not allowed" 错误
+
+#### 12.3 聚合测试（跨分片合并）
+- [x] `COUNT(*)` 跨分片求和
+- [x] `SUM(column)` 跨分片求和
+- [x] `MAX(column)` 跨分片取最大
+- [x] `MIN(column)` 跨分片取最小
+- [x] 多聚合函数单查询
+
+#### 12.4 事务测试（`tests/integration/transaction.rs`）
+- [x] 基础事务：COMMIT/ROLLBACK 语义正确
+- [x] 事务隔离：未提交数据在事务内可见
+- [x] 跨分片事务拒绝："Cross-shard query in transaction not allowed"
+- [x] 事务内 scatter 查询拒绝："Scatter queries not allowed in transaction"
+
+#### 12.5 读写分离测试（`tests/integration/rw_split.rs`）
+- [x] 事务内读走 master（read-your-writes）
+- [x] 事务控制语句走 master
+- [x] 从库路由检测（若配置了 slave）
+
+**运行方式：**
+```bash
+ATHENA_RUN_INTEGRATION_TESTS=1 cargo test --test integration
+```
+
+**环境变量：**
+- `ATHENA_TEST_PROXY_HOST` - 代理地址（默认 127.0.0.1）
+- `ATHENA_TEST_PROXY_PORT` - 代理端口（默认 3307）
+- `ATHENA_TEST_PROXY_USER` - 代理用户（默认 app_user）
+- `ATHENA_TEST_PROXY_PASS` - 代理密码（默认 test123）
+- `ATHENA_TEST_SHARD_COUNT` - 分片数量（默认 4）
+
+---
+
 ## 目录结构
 
 ```
@@ -521,9 +578,11 @@ athena-rs/
 │       └── state.rs            # 含 session_vars 存储
 ├── tests/
 │   └── integration/             # 集成测试
-│       ├── main.rs
-│       ├── transaction.rs
-│       └── limiter.rs
+│       ├── main.rs              # 测试入口和共享工具
+│       ├── sharding.rs          # 分片/JOIN/聚合测试
+│       ├── transaction.rs       # 事务和跨分片事务测试
+│       ├── rw_split.rs          # 读写分离测试
+│       └── limiter.rs           # 限流测试（placeholder）
 ├── config/
 │   └── athena.toml
 └── docs/
@@ -554,4 +613,7 @@ prometheus = "0.13"           # Phase 6 新增
 hyper = { version = "1.1", features = ["server", "http1"] }  # Phase 6 新增
 hyper-util = { version = "0.1", features = ["tokio"] }       # Phase 6 新增
 http-body-util = "0.1"        # Phase 6 新增
+
+[dev-dependencies]
+mysql = "25"                  # Phase 12 新增：集成测试客户端
 ```

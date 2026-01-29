@@ -1,4 +1,26 @@
-# Routing Refactor: Index-based Mapping
+# TODO
+
+## Pending Tasks
+
+### Shard 计算方式问题
+- **问题**: 当前的 shard 计算方式存在问题（待具体分析）
+- **位置**: `src/router/shard.rs` 中的 `ShardCalculator`
+- **状态**: 待修复
+
+---
+
+# Completed
+
+## Pool Manager Topology Refactor (COMPLETED)
+
+- 改用 `home_group` + `shard_indices` 配置模式
+- `DBGroupConfig` 增加 `shard_indices: Vec<usize>` 字段
+- `GroupConfig` 增加 `home_group` 字段
+- `build_pool_manager` 按 `shard_indices` 注册分片索引到对应 db_group
+
+---
+
+# Routing Refactor: Index-based Mapping (COMPLETED)
 
 ## Goal
 1. `ShardId` -> `DbGroupId`, clearer semantics

@@ -251,7 +251,8 @@ mod tests {
 
     fn create_test_db_group() -> DBGroupConfig {
         DBGroupConfig {
-            name: "shard_0".to_string(),
+            name: "db0".to_string(),
+            shard_indices: vec![0],
             instances: vec![
                 create_test_instance("master-1", DBInstanceRole::Master),
                 create_test_instance("master-2", DBInstanceRole::Master),
@@ -325,7 +326,8 @@ mod tests {
 
         // DB group with no slaves
         let db_group = DBGroupConfig {
-            name: "shard_0".to_string(),
+            name: "db0".to_string(),
+            shard_indices: vec![0],
             instances: vec![create_test_instance("master-1", DBInstanceRole::Master)],
         };
 
@@ -341,7 +343,8 @@ mod tests {
 
         // DB group with no slaves
         let db_group = DBGroupConfig {
-            name: "shard_0".to_string(),
+            name: "db0".to_string(),
+            shard_indices: vec![0],
             instances: vec![create_test_instance("master-1", DBInstanceRole::Master)],
         };
 
@@ -357,7 +360,8 @@ mod tests {
     fn test_empty_instances() {
         let router = ReadWriteRouter::default();
         let db_group = DBGroupConfig {
-            name: "shard_0".to_string(),
+            name: "db0".to_string(),
+            shard_indices: vec![0],
             instances: vec![],
         };
 

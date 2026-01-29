@@ -14,24 +14,28 @@ queue_timeout_ms = 5000
 # =============================================================================
 # Sharding Group Configuration
 # =============================================================================
-# 
-# 架构说明:
-# - home: 非分片表的默认数据库 (athena_rs_test)
-# - shard_0, shard_1: 分片数据库 0 (athena_shard_0) 的分表
-# - shard_2, shard_3: 分片数据库 1 (athena_shard_1) 的分表
 #
-# 数据分布:
-# - athena_rs_test: users (非分片表)
-# - athena_shard_0: orders_0, orders_1
-# - athena_shard_1: orders_2, orders_3
+# 拓扑规则:
+# - home_group: 指定非分片表的 db_group 名称
+# - shard_indices: 每个 db_group 负责的分片索引列表
+#
+# 路由过程:
+# 1. shard_index = algorithm(shard_column) % shard_count
+# 2. 物理表名 = 逻辑表名 + "_" + shard_index
+# 3. shard_index → db_group (通过 shard_indices 查找)
+#
+# 当前配置:
+# - home: 非分片表 → athena_rs_test
+# - db0: shard_indices=[0,1] → athena_shard_0
+# - db1: shard_indices=[2,3] → athena_shard_1
 
 [[groups]]
 name = "athena_rs_test"
 user = "app_user"
 password = "test123"
+home_group = "home"
 
-# Sharding rule: orders table sharded by user_id (string) using hash algorithm
-# 4 shards = 2 databases × 2 tables per database
+# Sharding rule: orders table sharded by user_id using hash algorithm
 [[groups.sharding_rules]]
 name = "order_shard"
 table_pattern = "orders"
@@ -44,6 +48,7 @@ shard_count = 4
 # =============================================================================
 [[groups.db_groups]]
 name = "home"
+# shard_indices is empty (default) - this is the home group
 
 [[groups.db_groups.instances]]
 host = "10.78.81.148"
@@ -57,18 +62,8 @@ role = "master"
 # Shard DB 0: athena_shard_0 (orders_0, orders_1)
 # =============================================================================
 [[groups.db_groups]]
-name = "shard_0"
-
-[[groups.db_groups.instances]]
-host = "10.78.81.148"
-port = 3306
-user = "rw_dbpaas"
-password = "GpoqEDWg80vO"
-database = "athena_shard_0"
-role = "master"
-
-[[groups.db_groups]]
-name = "shard_1"
+name = "db0"
+shard_indices = [0, 1]
 
 [[groups.db_groups.instances]]
 host = "10.78.81.148"
@@ -82,18 +77,8 @@ role = "master"
 # Shard DB 1: athena_shard_1 (orders_2, orders_3)
 # =============================================================================
 [[groups.db_groups]]
-name = "shard_2"
-
-[[groups.db_groups.instances]]
-host = "10.78.81.148"
-port = 3306
-user = "rw_dbpaas"
-password = "GpoqEDWg80vO"
-database = "athena_shard_1"
-role = "master"
-
-[[groups.db_groups]]
-name = "shard_3"
+name = "db1"
+shard_indices = [2, 3]
 
 [[groups.db_groups.instances]]
 host = "10.78.81.148"

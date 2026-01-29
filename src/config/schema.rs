@@ -84,6 +84,9 @@ pub struct GroupConfig {
     pub user: String,
     /// Proxy authentication password (NOT the backend MySQL password)
     pub password: String,
+    /// Name of the home db_group (for non-sharded tables) - REQUIRED
+    /// Must match one of the db_groups.name
+    pub home_group: String,
     /// Database groups (shards) in this group
     #[serde(default)]
     pub db_groups: Vec<DBGroupConfig>,
@@ -92,14 +95,38 @@ pub struct GroupConfig {
     pub sharding_rules: Vec<ShardingRule>,
 }
 
-/// DBGroup: Backend cluster (one shard's physical implementation)
+impl GroupConfig {
+    /// Validate that home_group references an existing db_group
+    pub fn validate(&self) -> Result<(), String> {
+        if self.home_group.is_empty() {
+            return Err(format!(
+                "Group '{}': home_group is required but was empty",
+                self.name
+            ));
+        }
+        if !self.db_groups.iter().any(|dg| dg.name == self.home_group) {
+            return Err(format!(
+                "Group '{}': home_group '{}' not found in db_groups",
+                self.name, self.home_group
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// DBGroup: Backend cluster (one or more shards' physical implementation)
 ///
 /// A DBGroup contains multiple DBInstances (master + slaves).
-/// In a sharded setup, each shard has its own DBGroup.
+/// In a sharded setup, a DBGroup can hold one or more shard indices.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DBGroupConfig {
-    /// Group name (used as shard identifier for routing, e.g., "default", "shard_0")
+    /// Group name (arbitrary, e.g., "home", "db0", "db1")
     pub name: String,
+    /// Shard indices this db_group is responsible for.
+    /// Empty means this is the home group (for non-sharded tables).
+    /// Example: [0,1] means shard_index 0 and 1 both route to this db_group.
+    #[serde(default)]
+    pub shard_indices: Vec<usize>,
     /// Database instances in this group
     pub instances: Vec<DBInstanceConfig>,
 }
@@ -269,8 +296,10 @@ impl Default for Config {
                 name: "default".to_string(),
                 user: "root".to_string(),
                 password: String::new(),
+                home_group: "home".to_string(),
                 db_groups: vec![DBGroupConfig {
-                    name: "shard_0".to_string(),
+                    name: "home".to_string(),
+                    shard_indices: vec![],
                     instances: vec![DBInstanceConfig {
                         host: "127.0.0.1".to_string(),
                         port: 3306,
@@ -371,9 +400,10 @@ listen_addr = "0.0.0.0"
 name = "default"
 user = "app"
 password = "secret"
+home_group = "home"
 
 [[groups.db_groups]]
-name = "shard_0"
+name = "home"
 
 [[groups.db_groups.instances]]
 host = "mysql.local"
@@ -387,6 +417,7 @@ role = "master"
         assert_eq!(config.server.listen_port, 3307); // default
         assert_eq!(config.groups.len(), 1);
         assert_eq!(config.groups[0].name, "default");
+        assert_eq!(config.groups[0].home_group, "home");
         assert_eq!(config.groups[0].db_groups[0].instances[0].host, "mysql.local");
         assert!(config.circuit.enabled); // default
         assert!(config.sharding.is_empty());
@@ -402,9 +433,11 @@ listen_addr = "127.0.0.1"
 name = "tenant_a"
 user = "app_user"
 password = "proxy_secret"
+home_group = "db0"
 
 [[groups.db_groups]]
-name = "shard_0"
+name = "db0"
+shard_indices = [0]
 
 [[groups.db_groups.instances]]
 host = "mysql-1"
@@ -432,8 +465,10 @@ max_concurrent = 200
         assert_eq!(config.groups[0].name, "tenant_a");
         assert_eq!(config.groups[0].user, "app_user");
         assert_eq!(config.groups[0].password, "proxy_secret");
+        assert_eq!(config.groups[0].home_group, "db0");
         assert_eq!(config.groups[0].db_groups.len(), 1);
-        assert_eq!(config.groups[0].db_groups[0].name, "shard_0");
+        assert_eq!(config.groups[0].db_groups[0].name, "db0");
+        assert_eq!(config.groups[0].db_groups[0].shard_indices, vec![0]);
         assert_eq!(config.groups[0].db_groups[0].instances.len(), 2);
 
         let master = &config.groups[0].db_groups[0].instances[0];
@@ -459,9 +494,10 @@ listen_port = 3307
 name = "default"
 user = "root"
 password = ""
+home_group = "home"
 
 [[groups.db_groups]]
-name = "shard_0"
+name = "home"
 
 [[groups.db_groups.instances]]
 host = "localhost"
@@ -505,9 +541,10 @@ listen_addr = "127.0.0.1"
 name = "default"
 user = "root"
 password = ""
+home_group = "home"
 
 [[groups.db_groups]]
-name = "shard_0"
+name = "home"
 
 [[groups.db_groups.instances]]
 host = "localhost"
@@ -578,7 +615,8 @@ queue_timeout_ms = 3000
     #[test]
     fn test_db_group_config_masters_slaves() {
         let db_group = DBGroupConfig {
-            name: "shard_0".to_string(),
+            name: "db0".to_string(),
+            shard_indices: vec![0, 1],
             instances: vec![
                 DBInstanceConfig {
                     host: "master-1".to_string(),
@@ -623,12 +661,14 @@ queue_timeout_ms = 3000
         assert_eq!(primary.host, "master-1");
 
         assert!(db_group.has_slaves());
+        assert_eq!(db_group.shard_indices, vec![0, 1]);
     }
 
     #[test]
     fn test_db_group_config_no_slaves() {
         let db_group = DBGroupConfig {
-            name: "shard_0".to_string(),
+            name: "home".to_string(),
+            shard_indices: vec![],
             instances: vec![DBInstanceConfig {
                 host: "master-1".to_string(),
                 port: 3306,
@@ -643,6 +683,7 @@ queue_timeout_ms = 3000
         assert!(!db_group.has_slaves());
         assert!(db_group.slaves().is_empty());
         assert!(db_group.primary_master().is_some());
+        assert!(db_group.shard_indices.is_empty());
     }
 
     #[test]
@@ -664,9 +705,10 @@ listen_addr = "127.0.0.1"
 name = "default"
 user = "root"
 password = ""
+home_group = "home"
 
 [[groups.db_groups]]
-name = "shard_0"
+name = "home"
 
 [[groups.db_groups.instances]]
 host = "localhost"
@@ -686,5 +728,49 @@ check_timeout_ms = 5000
         assert_eq!(config.health.check_interval_ms, 10000);
         assert_eq!(config.health.failure_threshold, 3);
         assert_eq!(config.health.check_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn test_group_config_validate() {
+        // Valid config
+        let valid_group = GroupConfig {
+            name: "test".to_string(),
+            user: "user".to_string(),
+            password: "pass".to_string(),
+            home_group: "home".to_string(),
+            db_groups: vec![DBGroupConfig {
+                name: "home".to_string(),
+                shard_indices: vec![],
+                instances: vec![],
+            }],
+            sharding_rules: vec![],
+        };
+        assert!(valid_group.validate().is_ok());
+
+        // Empty home_group
+        let empty_home = GroupConfig {
+            name: "test".to_string(),
+            user: "user".to_string(),
+            password: "pass".to_string(),
+            home_group: "".to_string(),
+            db_groups: vec![],
+            sharding_rules: vec![],
+        };
+        assert!(empty_home.validate().is_err());
+
+        // home_group not found in db_groups
+        let not_found = GroupConfig {
+            name: "test".to_string(),
+            user: "user".to_string(),
+            password: "pass".to_string(),
+            home_group: "nonexistent".to_string(),
+            db_groups: vec![DBGroupConfig {
+                name: "home".to_string(),
+                shard_indices: vec![],
+                instances: vec![],
+            }],
+            sharding_rules: vec![],
+        };
+        assert!(not_found.validate().is_err());
     }
 }

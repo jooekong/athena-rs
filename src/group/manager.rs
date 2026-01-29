@@ -65,6 +65,12 @@ impl GroupManager {
 
         // Build groups from config
         for group_config in &config.groups {
+            // Validate group config
+            if let Err(e) = group_config.validate() {
+                error!("{}", e);
+                continue;
+            }
+
             let context = Self::build_group_context(
                 group_config,
                 &health_registry,
@@ -96,6 +102,7 @@ impl GroupManager {
         // Build pool manager
         let pool_manager = Self::build_pool_manager(
             &group_config.db_groups,
+            &group_config.home_group,
             health_registry,
             pool_config,
         )
@@ -112,61 +119,40 @@ impl GroupManager {
 
     /// Build pool manager for a group's db_groups
     ///
-    /// db_groups are added by index order (0, 1, 2, ...).
-    /// The first db_group is also used as the home group fallback.
+    /// - The db_group matching `home_group` name is set as the home group
+    /// - Each db_group with `shard_indices` registers those indices to point to this db_group
     async fn build_pool_manager(
         db_groups: &[DBGroupConfig],
+        home_group_name: &str,
         health_registry: &Arc<InstanceRegistry>,
         pool_config: &StatelessPoolConfig,
     ) -> PoolManager {
-        // Use first master as default backend (for PoolManager::new)
-        let default_backend = db_groups
-            .first()
+        // Find home group by name
+        let home_group = db_groups.iter().find(|dg| dg.name == home_group_name);
+
+        let default_backend = home_group
             .and_then(|dg| dg.primary_master())
             .map(|inst| inst.to_backend_config())
             .unwrap_or_else(|| {
-                // This is a configuration error - no db_groups or no masters configured
-                // Log error but don't panic - let the connection fail at runtime
-                // with a clear error message
-                error!(
-                    "No db_groups configured or no master in first db_group! \
-                     Connections will fail. Please check your configuration."
-                );
-                BackendConfig::default()
+                // Fall back to first db_group's master if no home group
+                db_groups
+                    .first()
+                    .and_then(|dg| dg.primary_master())
+                    .map(|inst| inst.to_backend_config())
+                    .unwrap_or_else(|| {
+                        error!(
+                            "No db_groups configured or no master found! \
+                             Connections will fail. Please check your configuration."
+                        );
+                        BackendConfig::default()
+                    })
             });
 
         let pool_manager = PoolManager::new(default_backend, pool_config.clone());
 
-        // Add all shards by index order
-        for (index, db_group) in db_groups.iter().enumerate() {
-            // Collect masters and slaves
-            let masters: Vec<&DBInstanceConfig> = db_group.masters();
-            let slaves: Vec<&DBInstanceConfig> = db_group.slaves();
-
-            // Use primary master
-            let master = masters
-                .first()
-                .map(|m| m.to_backend_config())
-                .unwrap_or_else(|| {
-                    // This is a configuration error - shard has no master
-                    error!(
-                        db_group = %db_group.name,
-                        "No master configured for db_group! Queries to this db_group will fail."
-                    );
-                    BackendConfig::default()
-                });
-
-            // Convert slaves
-            let slave_configs: Vec<BackendConfig> =
-                slaves.iter().map(|s| s.to_backend_config()).collect();
-
-            // Create new-style DbGroupBackend
-            let db_group_backend = DbGroupBackend {
-                master,
-                slaves: slave_configs,
-            };
-
-            pool_manager.add_shard(index, db_group_backend).await;
+        for db_group in db_groups.iter() {
+            // Build DbGroupBackend
+            let db_group_backend = Self::build_db_group_backend(db_group);
 
             // Register instances for health checks
             for inst in &db_group.instances {
@@ -175,19 +161,59 @@ impl GroupManager {
                     addr = %inst.addr(),
                     role = ?inst.role,
                     db_group = %db_group.name,
-                    index = index,
                     "Registered instance for health checks"
                 );
             }
 
-            debug!(
-                db_group = %db_group.name,
-                index = index,
-                "Added db_group at index"
-            );
+            // Home group: matched by name
+            if db_group.name == home_group_name {
+                pool_manager.set_home(db_group_backend).await;
+                debug!(db_group = %db_group.name, "Set as home group");
+            } else if !db_group.shard_indices.is_empty() {
+                // Shard group: register each shard_index to this db_group
+                for &shard_idx in &db_group.shard_indices {
+                    pool_manager.add_shard(shard_idx, db_group_backend.clone()).await;
+                    debug!(
+                        db_group = %db_group.name,
+                        shard_index = shard_idx,
+                        "Registered shard index"
+                    );
+                }
+            } else {
+                // db_group with no shard_indices and not home - warn
+                error!(
+                    db_group = %db_group.name,
+                    "db_group has no shard_indices and is not home_group, skipping"
+                );
+            }
         }
 
         pool_manager
+    }
+
+    /// Build DbGroupBackend from DBGroupConfig
+    fn build_db_group_backend(db_group: &DBGroupConfig) -> DbGroupBackend {
+        let masters: Vec<&DBInstanceConfig> = db_group.masters();
+        let slaves: Vec<&DBInstanceConfig> = db_group.slaves();
+
+        let master = masters
+            .first()
+            .map(|m| m.to_backend_config())
+            .unwrap_or_else(|| {
+                error!(
+                    db_group = %db_group.name,
+                    "No master configured for db_group! Queries will fail."
+                );
+                BackendConfig::default()
+            });
+
+        let slave_configs: Vec<BackendConfig> =
+            slaves.iter().map(|s| s.to_backend_config()).collect();
+
+        DbGroupBackend {
+            master,
+            slaves: slave_configs,
+        }
     }
 
     /// Get group by name

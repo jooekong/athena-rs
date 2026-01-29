@@ -39,21 +39,22 @@
 
 ## 配置方式
 
-分片规则在 Group 配置中通过 `sharding_rules` 定义：
+分片规则在 Group 配置中通过 `sharding_rules` 和 `db_groups` 定义：
 
 ```toml
 [[groups]]
 name = "my_database"
 user = "app_user"
 password = "proxy_password"
+home_group = "home"           # 非分片表的 db_group 名称
 
-# 分片规则
+# 分片规则（每张表的分片策略）
 [[groups.sharding_rules]]
 name = "user_shard"           # 规则名称（用于日志/调试）
 table_pattern = "users"       # 表名模式（精确匹配，大小写不敏感）
 shard_column = "user_id"      # 分片键列名
 algorithm = "mod"             # 分片算法：mod | hash | range
-shard_count = 4               # 分片数量（mod/hash 算法使用）
+shard_count = 4               # 分片数量（该表的分片数）
 
 [[groups.sharding_rules]]
 name = "order_shard"
@@ -62,16 +63,11 @@ shard_column = "order_id"
 algorithm = "hash"
 shard_count = 8
 
-[[groups.sharding_rules]]
-name = "log_shard"
-table_pattern = "logs"
-shard_column = "log_date"
-algorithm = "range"
-range_boundaries = [20230101, 20230401, 20230701, 20231001]  # 范围边界
-
-# 后端数据库组（每个 db_group 对应一个分片）
+# Home 数据库组（非分片表）
 [[groups.db_groups]]
-name = "shard_0"              # 必须匹配 shard_{index} 格式
+name = "home"
+# shard_indices 留空表示这是 home group
+
 [[groups.db_groups.instances]]
 host = "10.0.0.1"
 port = 3306
@@ -80,24 +76,42 @@ password = "mysql_password"
 database = "my_database"
 role = "master"
 
+# 分片数据库组（通过 shard_indices 声明负责的分片索引）
 [[groups.db_groups]]
-name = "shard_1"
+name = "db0"
+shard_indices = [0, 1]        # 负责 shard_index 0 和 1
+
 [[groups.db_groups.instances]]
 host = "10.0.1.1"
 port = 3306
 user = "mysql_user"
 password = "mysql_password"
-database = "my_database"
+database = "my_database_shard_0"
 role = "master"
 
-# ... 更多分片
+[[groups.db_groups]]
+name = "db1"
+shard_indices = [2, 3]        # 负责 shard_index 2 和 3
+
+[[groups.db_groups.instances]]
+host = "10.0.2.1"
+port = 3306
+user = "mysql_user"
+password = "mysql_password"
+database = "my_database_shard_1"
+role = "master"
 ```
 
-### 命名约定
+### 配置说明
 
-- `db_groups.name` 必须遵循 `shard_{index}` 格式（如 `shard_0`、`shard_1`）
-- `index` 从 0 开始，与分片算法计算结果对应
-- 未来可能支持自定义 shard_id 到 db_group 的映射
+- **`home_group`**：指定非分片表的 db_group 名称（默认 `"home"`）
+- **`shard_indices`**：每个 db_group 声明它负责的分片索引列表
+  - 留空表示这是 home group
+  - 一个 db_group 可以负责多个 shard_index（如 `[0, 1]`）
+- **路由过程**：
+  1. `shard_index = algorithm(shard_column) % shard_count`
+  2. 物理表名 = `逻辑表名_shard_index`
+  3. 根据 `shard_indices` 找到对应的 db_group
 
 ---
 
@@ -345,32 +359,38 @@ SELECT * FROM users_1 WHERE user_id = 5;
    - 中间分片只返回数据行
    - 最后一个分片返回 EOF
 
-### 简单聚合合并（待实现）
+### 简单聚合合并 ✅ 已实现
 
 对于以下聚合函数，支持跨分片合并：
 
-| 函数 | 合并策略 |
-|------|---------|
-| `COUNT(*)` | 各分片 count 求和 |
-| `SUM(col)` | 各分片 sum 求和 |
-| `MAX(col)` | 各分片 max 取最大 |
-| `MIN(col)` | 各分片 min 取最小 |
+| 函数 | 合并策略 | 状态 |
+|------|---------|------|
+| `COUNT(*)` | 各分片 count 求和 | ✅ 已实现 |
+| `SUM(col)` | 各分片 sum 求和 | ✅ 已实现 |
+| `MAX(col)` | 各分片 max 取最大 | ✅ 已实现 |
+| `MIN(col)` | 各分片 min 取最小 | ✅ 已实现 |
+| `AVG(col)` | 各分片 avg 平均（注意：当前实现有精度问题） | ⚠️ 部分支持 |
 
-**实现思路：**
-```
-1. 检测 SQL 是否为简单聚合（单个聚合函数，无 GROUP BY）
+**实现细节：**
+1. SQL 分析器检测 SELECT 中的聚合函数（`src/parser/analyzer.rs`）
 2. 执行各分片查询
-3. 解析各分片返回的聚合结果
-4. 按规则合并
-5. 构造合并后的结果集返回
+3. `AggregateMerger` 解析并合并各分片结果（`src/parser/aggregator.rs`）
+4. 构造单行合并结果返回给客户端
+
+**示例：**
+```sql
+-- 跨 4 个分片的 COUNT/SUM/MAX/MIN 将被正确合并
+SELECT COUNT(*), SUM(amount), MAX(amount), MIN(amount) FROM orders;
 ```
 
 ### 当前行为
 
-- 多分片结果直接拼接
+- ✅ 简单聚合（COUNT/SUM/MAX/MIN）正确合并
+- 非聚合 scatter 查询：多分片结果直接拼接
 - **不支持** `ORDER BY`（各分片结果顺序不保证）
 - **不支持** `LIMIT`（各分片都执行完整 LIMIT，结果可能超出预期）
 - **不支持** `GROUP BY`（各分片分组不会合并）
+- **AVG 精度问题**：当前实现对各分片 AVG 结果再求平均，而非 SUM/COUNT 后计算
 
 ---
 
@@ -451,8 +471,8 @@ WHERE u.user_id = 1 AND o.order_id = 2;
 | 顺序执行 | Scatter 查询性能较低 | 避免全分片扫描 |
 | 无结果合并 | ORDER BY/LIMIT 语义错误 | 应用层处理排序分页 |
 | 字符串改写 | 复杂 SQL 可能改写错误 | 使用简单 SQL 结构 |
-| 无聚合合并 | COUNT/SUM 等结果不正确 | 应用层聚合或避免跨分片聚合 |
 | Range 仅支持整数 | 字符串不能用于 Range 分片 | 使用 Mod/Hash 算法 |
+| AVG 精度问题 | 各分片 AVG 再平均而非 SUM/COUNT | 使用 SUM 和 COUNT 分开查询 |
 
 ### 已完成改进
 
@@ -460,17 +480,15 @@ WHERE u.user_id = 1 AND o.order_id = 2;
 - ✅ **空交集错误**：多表查询分片交集为空时返回错误
 - ✅ **字符串分片键**：Mod 和 Hash 算法均支持字符串分片键
 - ✅ **复合标识符**：支持 `table.column` 形式的列名提取
+- ✅ **简单聚合合并**：COUNT/SUM/MAX/MIN 跨分片正确合并
+- ✅ **集成测试覆盖**：分片、聚合、JOIN、事务场景均有测试
 
 ### 未来改进
 
 **中期：**
 
-1. **简单聚合合并**：
-   - `COUNT(*)` → 各分片求和
-   - `SUM(col)` → 各分片求和
-   - `MAX(col)` → 各分片取最大
-   - `MIN(col)` → 各分片取最小
-2. **并行分片执行**：使用 `tokio::join!` 或 `FuturesUnordered` 并行执行
+1. **并行分片执行**：使用 `tokio::join!` 或 `FuturesUnordered` 并行执行
+2. **AVG 精度修复**：跟踪 SUM 和 COUNT，最后计算 AVG = SUM/COUNT
 
 **长期：**
 
@@ -498,14 +516,14 @@ WHERE u.user_id = 1 AND o.order_id = 2;
 
 **待讨论**：是否允许"显式广播"模式（如 `/*+ SCATTER */` hint）？
 
-### 3. 聚合合并的范围
+### 3. 聚合合并的范围（✅ 已实现）
 
-**已确认支持**：`COUNT`、`SUM`、`MAX`、`MIN`（待实现）
+**已实现支持**：`COUNT`、`SUM`、`MAX`、`MIN`
+
+**AVG 支持状态**：已实现但有精度问题（各分片 AVG 再平均，而非正确的 SUM/COUNT）
 
 **待讨论**：
-- `AVG` 需要转换为 SUM/COUNT 再计算
-- `COUNT(DISTINCT)` 需要收集所有值再去重（代价高）
-- 是否值得支持？
+- `COUNT(DISTINCT)` 需要收集所有值再去重（代价高），暂不支持
 
 ### 4. 分片命名约定
 
